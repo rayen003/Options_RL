@@ -133,6 +133,13 @@ class OptionsEnv(gym.Env):
         self.vol_long_term_mean = vol_long_term_mean
         self.initial_volatility = volatility  # Store initial vol for reset
         
+        # REAL-LIFE SETUP:
+        # - true_volatility: Hidden vol that market maker uses (agent doesn't see)
+        # - market_price: Price computed from true_volatility
+        # - implied_volatility: Agent extracts this using Newton-Raphson
+        self.true_volatility = volatility    # Hidden from agent
+        self.implied_volatility = volatility  # What agent extracts from prices
+        
         # Initialize BSM pricing engine
         self.bsm = TorchBSM()
         
@@ -213,19 +220,58 @@ class OptionsEnv(gym.Env):
         """
         Construct the observation vector from current state.
         
-        This is called after every step to give the agent the new state.
-        All values are normalized/scaled for better RL training.
+        REAL-LIFE WORKFLOW:
+        ===================
+        1. Market maker prices option using true_volatility (hidden)
+        2. Agent sees market_price on screen
+        3. Agent uses Newton-Raphson to extract implied_volatility
+        4. Agent computes Greeks using extracted IV
+        5. Agent makes decisions based on extracted IV, NOT true vol
+        
+        This is realistic - in real life you never know the "true" volatility!
         """
-        # Compute option price and Greeks
-        self.greeks = self.bsm.price_and_greeks(
-            spot=self.spot,
-            strike=self.strike,
-            time_to_maturity=max(self.tte, 0.001),  # Avoid division by zero
-            rate=self.rate,
-            volatility=self.volatility,
-            option_type="call"
-        )
-        self.option_price = self.greeks["price"]
+        # =====================================================================
+        # STEP 1: Market maker prices using TRUE volatility (hidden from agent)
+        # =====================================================================
+        if self.use_stochastic_vol:
+            # Market price is set by the "market maker" using true vol
+            self.option_price = self.bsm.price_option(
+                spot=self.spot,
+                strike=self.strike,
+                time_to_maturity=max(self.tte, 0.001),
+                rate=self.rate,
+                volatility=self.true_volatility,  # TRUE vol - agent doesn't see this
+                option_type="call"
+            )
+            
+            # =====================================================================
+            # STEP 2: Agent extracts IV using Newton-Raphson (REAL-LIFE PROCESS)
+            # =====================================================================
+            self._extract_implied_volatility()
+            
+            # =====================================================================
+            # STEP 3: Agent computes Greeks using EXTRACTED IV
+            # =====================================================================
+            # Agent uses their extracted IV estimate to compute Greeks
+            self.greeks = self.bsm.price_and_greeks(
+                spot=self.spot,
+                strike=self.strike,
+                time_to_maturity=max(self.tte, 0.001),
+                rate=self.rate,
+                volatility=self.implied_volatility,  # EXTRACTED IV - this is what agent knows
+                option_type="call"
+            )
+        else:
+            # No stochastic vol: use fixed volatility
+            self.greeks = self.bsm.price_and_greeks(
+                spot=self.spot,
+                strike=self.strike,
+                time_to_maturity=max(self.tte, 0.001),
+                rate=self.rate,
+                volatility=self.initial_volatility,
+                option_type="call"
+            )
+            self.option_price = self.greeks["price"]
         
         # Calculate unrealized PnL
         if self.position != 0:
@@ -246,14 +292,14 @@ class OptionsEnv(gym.Env):
             unrealized_pnl / self.initial_cash,       # Normalized PnL
         ]
         
-        # NEW: Add regime signal if using regimes
         # Add regime signal if using regimes
         if self.use_regime:
             base_obs.append(float(self.regime))      # -1 = bear, +1 = bull
         
-        # Add IV if using stochastic volatility
+        # Add EXTRACTED IV if using stochastic volatility
+        # Agent sees their Newton-Raphson extracted IV, NOT the true vol!
         if self.use_stochastic_vol:
-            base_obs.append(self.volatility)         # Current IV (0.05 to 1.0)
+            base_obs.append(self.implied_volatility)  # EXTRACTED IV (via Newton-Raphson)
         
         obs = np.array(base_obs, dtype=np.float32)
         
@@ -262,7 +308,14 @@ class OptionsEnv(gym.Env):
     def _get_info(self) -> Dict[str, Any]:
         """
         Return auxiliary information (not used by agent, but useful for debugging).
+        
+        REAL-LIFE SETUP:
+        - true_vol: Hidden volatility (market maker's secret)
+        - implied_vol: What agent extracted using Newton-Raphson
+        - iv_error: Difference between true and extracted (numerical error)
         """
+        iv_error = abs(self.true_volatility - self.implied_volatility) if self.use_stochastic_vol else 0.0
+        
         return {
             "spot": self.spot,
             "option_price": self.option_price,
@@ -273,8 +326,12 @@ class OptionsEnv(gym.Env):
             "tte": self.tte,
             "regime": self.regime,
             "regime_name": "BULL" if self.regime == 1 else "BEAR",
-            "iv": self.volatility,                    # Current implied volatility
-            "iv_pct": f"{self.volatility:.1%}",       # Human-readable IV
+            # REAL-LIFE IV SETUP
+            "true_vol": self.true_volatility,         # Hidden from agent (market maker's)
+            "implied_vol": self.implied_volatility,   # Agent's extracted IV
+            "iv_error": iv_error,                     # How accurate was Newton-Raphson?
+            "true_vol_pct": f"{self.true_volatility:.1%}",
+            "implied_vol_pct": f"{self.implied_volatility:.1%}",
         }
     
     def reset(
@@ -309,13 +366,18 @@ class OptionsEnv(gym.Env):
         else:
             self.regime = 1  # Default to bull if regimes disabled
         
-        # Reset IV to initial value (with small random perturbation)
+        # Reset volatility (REAL-LIFE SETUP)
         if self.use_stochastic_vol:
-            # Start near the initial volatility with some randomness
-            self.volatility = self.initial_volatility * (1 + 0.1 * self.np_random.standard_normal())
-            self.volatility = np.clip(self.volatility, 0.05, 1.0)
+            # TRUE volatility: Market maker's hidden vol (with random start)
+            self.true_volatility = self.initial_volatility * (1 + 0.1 * self.np_random.standard_normal())
+            self.true_volatility = np.clip(self.true_volatility, 0.05, 1.0)
+            
+            # IMPLIED volatility: What agent extracts (starts at initial guess)
+            # Agent will update this using Newton-Raphson on first observation
+            self.implied_volatility = self.initial_volatility
         else:
-            self.volatility = self.initial_volatility
+            self.true_volatility = self.initial_volatility
+            self.implied_volatility = self.initial_volatility
         
         # Get initial observation
         obs = self._get_observation()
@@ -327,24 +389,24 @@ class OptionsEnv(gym.Env):
     # STEP FUNCTION - The Core of the RL Environment
     # =========================================================================
     
-    def _simulate_iv_change(self) -> None:
+    def _simulate_true_volatility_change(self) -> None:
         """
-        Simulate IV (Implied Volatility) changes using Ornstein-Uhlenbeck process.
+        Simulate the TRUE volatility using Ornstein-Uhlenbeck process.
+        
+        REAL-LIFE SETUP:
+        ================
+        The "market maker" has access to this true volatility.
+        The AGENT does NOT see this - they only see market prices.
         
         The Ornstein-Uhlenbeck (OU) process is mean-reverting:
             dσ = κ(θ - σ)dt + ξ·dW
         
         Where:
-            - σ = current volatility
+            - σ = current true volatility
             - κ = mean reversion speed (vol_mean_reversion)
             - θ = long-term mean (vol_long_term_mean)
             - ξ = volatility of volatility (vol_of_vol)
             - dW = Wiener process increment
-        
-        This models the "volatility smile" dynamics:
-            - IV tends to revert to a long-term average (~20%)
-            - But can spike during market stress
-            - And can fall during calm periods
         """
         if not self.use_stochastic_vol:
             return
@@ -352,17 +414,64 @@ class OptionsEnv(gym.Env):
         dt = 1 / 252  # One trading day
         
         # Mean-reverting drift (pulls IV toward long-term mean)
-        mean_reversion = self.vol_mean_reversion * (self.vol_long_term_mean - self.volatility) * dt
+        mean_reversion = self.vol_mean_reversion * (self.vol_long_term_mean - self.true_volatility) * dt
         
         # Random shock to volatility
         Z = self.np_random.standard_normal()
         vol_shock = self.vol_of_vol * np.sqrt(dt) * Z
         
-        # Update volatility
-        self.volatility = self.volatility + mean_reversion + vol_shock
+        # Update TRUE volatility (hidden from agent)
+        self.true_volatility = self.true_volatility + mean_reversion + vol_shock
         
         # Keep volatility in reasonable bounds (5% to 100%)
-        self.volatility = np.clip(self.volatility, 0.05, 1.0)
+        self.true_volatility = np.clip(self.true_volatility, 0.05, 1.0)
+    
+    def _extract_implied_volatility(self) -> float:
+        """
+        NEWTON-RAPHSON IV EXTRACTION (Real-Life Workflow)
+        
+        This is what traders actually do:
+        1. See a market price on their screen
+        2. Use numerical methods to find the IV that matches the price
+        3. Make trading decisions based on extracted IV
+        
+        The agent sees ONLY:
+        - Market price (computed from hidden true_volatility)
+        - Extracted IV (via Newton-Raphson, has numerical error)
+        
+        The agent NEVER sees:
+        - The true_volatility (that's the market maker's secret)
+        """
+        if not self.use_stochastic_vol:
+            return self.initial_volatility
+        
+        # Compute market price using TRUE volatility (market maker's price)
+        market_price = self.bsm.price_option(
+            spot=self.spot,
+            strike=self.strike,
+            time_to_maturity=max(self.tte, 0.001),
+            rate=self.rate,
+            volatility=self.true_volatility,
+            option_type="call"
+        )
+        
+        # Agent uses Newton-Raphson to EXTRACT IV from market price
+        # This is the real-life process!
+        extracted_iv, converged = self.bsm.implied_volatility(
+            market_price=market_price,
+            spot=self.spot,
+            strike=self.strike,
+            time_to_maturity=max(self.tte, 0.001),
+            rate=self.rate,
+            option_type="call",
+            initial_guess=self.implied_volatility,  # Use previous IV as guess
+        )
+        
+        if converged:
+            self.implied_volatility = extracted_iv
+        # If didn't converge, keep previous IV estimate
+        
+        return self.implied_volatility
     
     def _simulate_price_movement(self) -> None:
         """
@@ -406,16 +515,17 @@ class OptionsEnv(gym.Env):
             mu = self.rate
         
         # =====================================================================
-        # Stochastic volatility (IV dynamics)
+        # Stochastic volatility (TRUE volatility dynamics - hidden from agent)
         # =====================================================================
-        self._simulate_iv_change()
+        self._simulate_true_volatility_change()
         
         # Random shock (standard normal)
         Z = self.np_random.standard_normal()
         
-        # GBM update with regime-dependent drift and stochastic vol
-        drift = (mu - 0.5 * self.volatility ** 2) * dt
-        diffusion = self.volatility * np.sqrt(dt) * Z
+        # GBM update with regime-dependent drift and TRUE volatility
+        # Stock moves based on true realized volatility (hidden from agent)
+        drift = (mu - 0.5 * self.true_volatility ** 2) * dt
+        diffusion = self.true_volatility * np.sqrt(dt) * Z
         
         self.spot = self.spot * np.exp(drift + diffusion)
         
@@ -587,9 +697,9 @@ class OptionsEnv(gym.Env):
 # =============================================================================
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("OptionsEnv: Full Environment Test (Regimes + IV Dynamics)")
-    print("=" * 70)
+    print("=" * 80)
+    print("OptionsEnv: REAL-LIFE WORKFLOW (Newton-Raphson IV Extraction)")
+    print("=" * 80)
     
     # Create environment with regimes and stochastic vol enabled
     env = OptionsEnv(use_regime=True, use_stochastic_vol=True)
@@ -597,16 +707,33 @@ if __name__ == "__main__":
     # Reset and get initial state
     obs, info = env.reset(seed=42)
     
-    print("\n" + "-" * 70)
+    print("\n" + "-" * 80)
+    print("REAL-LIFE WORKFLOW")
+    print("-" * 80)
+    print("""
+    1. Market Maker has TRUE volatility (hidden from agent)
+       - Evolves via Ornstein-Uhlenbeck process
+    
+    2. Market Maker prices option using TRUE volatility
+       - Agent sees this price on their screen
+    
+    3. Agent uses NEWTON-RAPHSON to extract IMPLIED volatility
+       - Finds σ such that: BSM(spot, strike, T, r, σ) = Market_Price
+    
+    4. Agent makes decisions using EXTRACTED IV (not true vol!)
+       - Greeks computed from extracted IV
+    """)
+    
+    print("-" * 80)
     print("CONFIGURATION")
-    print("-" * 70)
+    print("-" * 80)
     print(f"Observation Space: Box{env.observation_space.shape}")
     print(f"Action Space: Discrete({env.action_space.n})")
     print(f"\nMarket Regimes: ENABLED")
     print(f"  Bull Drift: {env.bull_drift:.0%}")
     print(f"  Bear Drift: {env.bear_drift:.0%}")
     print(f"  Switch Probability: {env.regime_switch_prob:.0%} per day")
-    print(f"\nStochastic Volatility: ENABLED")
+    print(f"\nStochastic Volatility: ENABLED (Real-Life Mode)")
     print(f"  Initial IV: {env.initial_volatility:.0%}")
     print(f"  Vol of Vol: {env.vol_of_vol:.0%}")
     print(f"  Mean Reversion Speed: {env.vol_mean_reversion}")
@@ -615,18 +742,18 @@ if __name__ == "__main__":
     # Feature names for display
     feature_names = [
         "spot_norm", "tte", "delta", "gamma",
-        "vega", "theta", "position", "pnl", "regime", "iv"
+        "vega", "theta", "position", "pnl", "regime", "implied_iv"
     ]
     
-    print("\n" + "-" * 70)
-    print("EPISODE SIMULATION (Random Agent with Regimes + IV)")
-    print("-" * 70)
+    print("\n" + "-" * 80)
+    print("EPISODE SIMULATION (Showing True Vol vs Extracted IV)")
+    print("-" * 80)
     
     total_reward = 0
     action_names = {0: "BUY ", 1: "HOLD", 2: "SELL"}
     
-    print(f"\n{'Step':>4} | {'Regime':>5} | {'IV':>6} | {'Action':>4} | {'Spot':>7} | {'OptPrice':>8} | {'Reward':>8}")
-    print("-" * 75)
+    print(f"\n{'Step':>4} | {'Regime':>5} | {'TrueVol':>7} | {'ExtractIV':>9} | {'Error':>6} | {'Action':>4} | {'Spot':>7} | {'Reward':>8}")
+    print("-" * 90)
     
     # Run a short episode
     for step in range(10):
@@ -638,22 +765,26 @@ if __name__ == "__main__":
         total_reward += reward
         
         regime_str = info['regime_name']
-        iv_str = info['iv_pct']
-        print(f"{step:>4} | {regime_str:>5} | {iv_str:>6} | {action_names[action]:>4} | ${info['spot']:>6.2f} | ${info['option_price']:>7.2f} | {reward:>+8.4f}")
+        true_vol = info['true_vol_pct']
+        impl_vol = info['implied_vol_pct']
+        iv_err = f"{info['iv_error']*100:.2f}%"
+        print(f"{step:>4} | {regime_str:>5} | {true_vol:>7} | {impl_vol:>9} | {iv_err:>6} | {action_names[action]:>4} | ${info['spot']:>6.2f} | {reward:>+8.4f}")
         
         if terminated or truncated:
             print("\n[Episode ended]")
             break
     
-    print("\n" + "-" * 70)
+    print("\n" + "-" * 80)
     print("FINAL STATE")
-    print("-" * 70)
+    print("-" * 80)
     print(f"  Cash:            ${info['cash']:.2f}")
     print(f"  Position:        {info['position']}")
     print(f"  Portfolio Value: ${info['portfolio_value']:.2f}")
     print(f"  Total Reward:    {total_reward:.4f}")
     print(f"  Final Regime:    {info['regime_name']}")
-    print(f"  Final IV:        {info['iv_pct']}")
+    print(f"\n  TRUE Volatility:     {info['true_vol_pct']}  (Hidden from agent)")
+    print(f"  EXTRACTED IV:        {info['implied_vol_pct']}  (Agent's estimate via Newton-Raphson)")
+    print(f"  IV Extraction Error: {info['iv_error']*100:.4f}%")
     
     print("\n" + "-" * 60)
     print("OBSERVATION BREAKDOWN (Final)")

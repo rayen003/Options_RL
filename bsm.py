@@ -312,6 +312,44 @@ class TorchBSM:
         """Convert a scalar to a tensor on the correct device."""
         return torch.tensor(value, dtype=torch.float32, device=self.device)
     
+    def price_option(
+        self,
+        spot: float,
+        strike: float,
+        time_to_maturity: float,
+        rate: float,
+        volatility: float,
+        option_type: str = "call",
+    ) -> float:
+        """
+        Price an option (call or put) using Black-Scholes.
+        
+        Args:
+            spot: Current stock price
+            strike: Option strike price
+            time_to_maturity: Years until expiration
+            rate: Risk-free rate (annualized)
+            volatility: Implied volatility (annualized)
+            option_type: "call" or "put"
+        
+        Returns:
+            Option price as a float
+        """
+        # Convert inputs to tensors
+        S = self._to_tensor(spot)
+        K = self._to_tensor(strike)
+        T = self._to_tensor(time_to_maturity)
+        r = self._to_tensor(rate)
+        sigma = self._to_tensor(volatility)
+        
+        # Price the option
+        if option_type == "call":
+            price = price_call(S, K, T, r, sigma)
+        else:
+            price = price_put(S, K, T, r, sigma)
+        
+        return price.item()
+    
     def price_and_greeks(
         self,
         spot: float,
