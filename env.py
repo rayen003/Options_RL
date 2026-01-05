@@ -71,11 +71,16 @@ class OptionsEnv(gym.Env):
         episode_length: int = 60,            # Trading days (default: 60 = ~3 months)
         transaction_cost: float = 0.02,      # 2% round-trip cost
         seed: Optional[int] = None,
-        # ==================== NEW: Market Regime Parameters ====================
+        # ==================== Market Regime Parameters ====================
         use_regime: bool = True,             # Enable market regimes
         bull_drift: float = 0.30,            # Annual drift in bull market (30%) - STRONGER
         bear_drift: float = -0.30,           # Annual drift in bear market (-30%) - STRONGER
         regime_switch_prob: float = 0.03,    # Daily probability of regime switch (3%) - less switching
+        # ==================== IV Dynamics Parameters ====================
+        use_stochastic_vol: bool = True,     # Enable stochastic volatility
+        vol_of_vol: float = 0.30,            # Volatility of volatility (30% annual)
+        vol_mean_reversion: float = 2.0,     # Mean reversion speed (higher = faster reversion)
+        vol_long_term_mean: float = 0.20,    # Long-term mean volatility (20%)
     ):
         """
         Initialize the options trading environment.
@@ -115,11 +120,18 @@ class OptionsEnv(gym.Env):
         min_tte = (episode_length + 10) / 252  # Add 10 day buffer
         self.initial_tte = max(time_to_expiry, min_tte)
         
-        # NEW: Market regime parameters
+        # Market regime parameters
         self.use_regime = use_regime
         self.bull_drift = bull_drift
         self.bear_drift = bear_drift
         self.regime_switch_prob = regime_switch_prob
+        
+        # IV dynamics parameters (stochastic volatility)
+        self.use_stochastic_vol = use_stochastic_vol
+        self.vol_of_vol = vol_of_vol
+        self.vol_mean_reversion = vol_mean_reversion
+        self.vol_long_term_mean = vol_long_term_mean
+        self.initial_volatility = volatility  # Store initial vol for reset
         
         # Initialize BSM pricing engine
         self.bsm = TorchBSM()
@@ -131,58 +143,44 @@ class OptionsEnv(gym.Env):
         # The bounds are "soft" - values can exceed them slightly, but this
         # gives the RL algorithm a sense of scale.
         
-        # Observation space size depends on whether we use regimes
-        # Base: 8 features + 1 regime signal (if use_regime) = 9 features
+        # Build observation space dynamically based on features enabled
+        # Base: 8 features + optional regime signal + optional IV
+        obs_low = [
+            0.5,    # spot_normalized: Stock won't drop below 50% in 30 days (usually)
+            0.0,    # time_to_expiry: Can reach 0
+            -1.0,   # delta: Put delta can be -1
+            0.0,    # gamma: Always positive
+            0.0,    # vega: Always positive
+            -50.0,  # theta: Can be very negative near expiry
+            -1.0,   # position: Short 1 contract
+            -1.0,   # pnl_normalized: Can lose up to 100% (margin call)
+        ]
+        obs_high = [
+            2.0,    # spot_normalized: Stock won't double in 30 days (usually)
+            0.5,    # time_to_expiry: Can be up to 6 months
+            1.0,    # delta: Call delta maxes at 1
+            1.0,    # gamma: Bounded in practice
+            50.0,   # vega: High but bounded
+            0.0,    # theta: Always negative for long options
+            1.0,    # position: Long 1 contract
+            2.0,    # pnl_normalized: Can make up to 200%
+        ]
+        
+        # Add regime signal if using regimes
         if self.use_regime:
-            self.observation_space = spaces.Box(
-                low=np.array([
-                    0.5,    # spot_normalized: Stock won't drop below 50% in 30 days (usually)
-                    0.0,    # time_to_expiry: Can reach 0
-                    -1.0,   # delta: Put delta can be -1
-                    0.0,    # gamma: Always positive
-                    0.0,    # vega: Always positive
-                    -50.0,  # theta: Can be very negative near expiry
-                    -1.0,   # position: Short 1 contract
-                    -1.0,   # pnl_normalized: Can lose up to 100% (margin call)
-                    -1.0,   # regime_signal: -1 = bear, +1 = bull
-                ], dtype=np.float32),
-                high=np.array([
-                    2.0,    # spot_normalized: Stock won't double in 30 days (usually)
-                    0.25,   # time_to_expiry: Starts at 3 months
-                    1.0,    # delta: Call delta maxes at 1
-                    1.0,    # gamma: Bounded in practice
-                    50.0,   # vega: High but bounded
-                    0.0,    # theta: Always negative for long options
-                    1.0,    # position: Long 1 contract
-                    2.0,    # pnl_normalized: Can make up to 200%
-                    1.0,    # regime_signal: -1 = bear, +1 = bull
-                ], dtype=np.float32),
-                dtype=np.float32
-            )
-        else:
-            self.observation_space = spaces.Box(
-                low=np.array([
-                    0.5,    # spot_normalized
-                    0.0,    # time_to_expiry
-                    -1.0,   # delta
-                    0.0,    # gamma
-                    0.0,    # vega
-                    -50.0,  # theta
-                    -1.0,   # position
-                    -1.0,   # pnl_normalized
-                ], dtype=np.float32),
-                high=np.array([
-                    2.0,    # spot_normalized
-                    0.25,   # time_to_expiry
-                    1.0,    # delta
-                    1.0,    # gamma
-                    50.0,   # vega
-                    0.0,    # theta
-                    1.0,    # position
-                    2.0,    # pnl_normalized
-                ], dtype=np.float32),
-                dtype=np.float32
-            )
+            obs_low.append(-1.0)   # regime_signal: -1 = bear
+            obs_high.append(1.0)   # regime_signal: +1 = bull
+        
+        # Add IV if using stochastic volatility
+        if self.use_stochastic_vol:
+            obs_low.append(0.05)   # iv_normalized: Min ~5% vol
+            obs_high.append(1.0)   # iv_normalized: Max ~100% vol
+        
+        self.observation_space = spaces.Box(
+            low=np.array(obs_low, dtype=np.float32),
+            high=np.array(obs_high, dtype=np.float32),
+            dtype=np.float32
+        )
         
         # =====================================================================
         # Define Action Space
@@ -249,8 +247,13 @@ class OptionsEnv(gym.Env):
         ]
         
         # NEW: Add regime signal if using regimes
+        # Add regime signal if using regimes
         if self.use_regime:
             base_obs.append(float(self.regime))      # -1 = bear, +1 = bull
+        
+        # Add IV if using stochastic volatility
+        if self.use_stochastic_vol:
+            base_obs.append(self.volatility)         # Current IV (0.05 to 1.0)
         
         obs = np.array(base_obs, dtype=np.float32)
         
@@ -268,8 +271,10 @@ class OptionsEnv(gym.Env):
             "greeks": self.greeks,
             "step": self.step_count,
             "tte": self.tte,
-            "regime": self.regime,                    # NEW: Current market regime
-            "regime_name": "BULL" if self.regime == 1 else "BEAR",  # Human-readable
+            "regime": self.regime,
+            "regime_name": "BULL" if self.regime == 1 else "BEAR",
+            "iv": self.volatility,                    # Current implied volatility
+            "iv_pct": f"{self.volatility:.1%}",       # Human-readable IV
         }
     
     def reset(
@@ -298,11 +303,19 @@ class OptionsEnv(gym.Env):
         self.entry_price = 0.0
         self.step_count = 0
         
-        # NEW: Reset market regime (random start: 50% bull, 50% bear)
+        # Reset market regime (random start: 50% bull, 50% bear)
         if self.use_regime:
             self.regime = 1 if self.np_random.random() < 0.5 else -1
         else:
             self.regime = 1  # Default to bull if regimes disabled
+        
+        # Reset IV to initial value (with small random perturbation)
+        if self.use_stochastic_vol:
+            # Start near the initial volatility with some randomness
+            self.volatility = self.initial_volatility * (1 + 0.1 * self.np_random.standard_normal())
+            self.volatility = np.clip(self.volatility, 0.05, 1.0)
+        else:
+            self.volatility = self.initial_volatility
         
         # Get initial observation
         obs = self._get_observation()
@@ -314,6 +327,43 @@ class OptionsEnv(gym.Env):
     # STEP FUNCTION - The Core of the RL Environment
     # =========================================================================
     
+    def _simulate_iv_change(self) -> None:
+        """
+        Simulate IV (Implied Volatility) changes using Ornstein-Uhlenbeck process.
+        
+        The Ornstein-Uhlenbeck (OU) process is mean-reverting:
+            dσ = κ(θ - σ)dt + ξ·dW
+        
+        Where:
+            - σ = current volatility
+            - κ = mean reversion speed (vol_mean_reversion)
+            - θ = long-term mean (vol_long_term_mean)
+            - ξ = volatility of volatility (vol_of_vol)
+            - dW = Wiener process increment
+        
+        This models the "volatility smile" dynamics:
+            - IV tends to revert to a long-term average (~20%)
+            - But can spike during market stress
+            - And can fall during calm periods
+        """
+        if not self.use_stochastic_vol:
+            return
+        
+        dt = 1 / 252  # One trading day
+        
+        # Mean-reverting drift (pulls IV toward long-term mean)
+        mean_reversion = self.vol_mean_reversion * (self.vol_long_term_mean - self.volatility) * dt
+        
+        # Random shock to volatility
+        Z = self.np_random.standard_normal()
+        vol_shock = self.vol_of_vol * np.sqrt(dt) * Z
+        
+        # Update volatility
+        self.volatility = self.volatility + mean_reversion + vol_shock
+        
+        # Keep volatility in reasonable bounds (5% to 100%)
+        self.volatility = np.clip(self.volatility, 0.05, 1.0)
+    
     def _simulate_price_movement(self) -> None:
         """
         Simulate one day of stock price movement using Geometric Brownian Motion.
@@ -323,19 +373,23 @@ class OptionsEnv(gym.Env):
         
         Where:
             - μ = drift (depends on market regime: bull or bear)
-            - σ = volatility (annualized)
+            - σ = volatility (annualized, now stochastic!)
             - dt = time step (1/252 years = 1 trading day)
             - Z = standard normal random variable
         
-        NEW: Market Regimes
-            - Bull market: drift = bull_drift (e.g., +15% annual)
-            - Bear market: drift = bear_drift (e.g., -15% annual)
+        Market Regimes:
+            - Bull market: drift = bull_drift (e.g., +30% annual)
+            - Bear market: drift = bear_drift (e.g., -30% annual)
             - Regimes switch randomly with probability regime_switch_prob
+        
+        Stochastic Volatility:
+            - IV changes each step via Ornstein-Uhlenbeck process
+            - Mean-reverts to long-term average
         """
         dt = 1 / 252  # One trading day in years
         
         # =====================================================================
-        # NEW: Regime switching
+        # Regime switching
         # =====================================================================
         if self.use_regime:
             # Check if regime should switch
@@ -351,10 +405,15 @@ class OptionsEnv(gym.Env):
             # No regimes: use risk-free rate as drift
             mu = self.rate
         
+        # =====================================================================
+        # Stochastic volatility (IV dynamics)
+        # =====================================================================
+        self._simulate_iv_change()
+        
         # Random shock (standard normal)
         Z = self.np_random.standard_normal()
         
-        # GBM update with regime-dependent drift
+        # GBM update with regime-dependent drift and stochastic vol
         drift = (mu - 0.5 * self.volatility ** 2) * dt
         diffusion = self.volatility * np.sqrt(dt) * Z
         
@@ -528,41 +587,46 @@ class OptionsEnv(gym.Env):
 # =============================================================================
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("OptionsEnv: Full Environment Test (WITH MARKET REGIMES)")
-    print("=" * 60)
+    print("=" * 70)
+    print("OptionsEnv: Full Environment Test (Regimes + IV Dynamics)")
+    print("=" * 70)
     
-    # Create environment with regimes enabled
-    env = OptionsEnv(use_regime=True)
+    # Create environment with regimes and stochastic vol enabled
+    env = OptionsEnv(use_regime=True, use_stochastic_vol=True)
     
     # Reset and get initial state
     obs, info = env.reset(seed=42)
     
-    print("\n" + "-" * 60)
-    print("SPACES")
-    print("-" * 60)
+    print("\n" + "-" * 70)
+    print("CONFIGURATION")
+    print("-" * 70)
     print(f"Observation Space: Box{env.observation_space.shape}")
     print(f"Action Space: Discrete({env.action_space.n})")
-    print(f"Market Regimes: ENABLED")
+    print(f"\nMarket Regimes: ENABLED")
     print(f"  Bull Drift: {env.bull_drift:.0%}")
     print(f"  Bear Drift: {env.bear_drift:.0%}")
     print(f"  Switch Probability: {env.regime_switch_prob:.0%} per day")
+    print(f"\nStochastic Volatility: ENABLED")
+    print(f"  Initial IV: {env.initial_volatility:.0%}")
+    print(f"  Vol of Vol: {env.vol_of_vol:.0%}")
+    print(f"  Mean Reversion Speed: {env.vol_mean_reversion}")
+    print(f"  Long-term Mean: {env.vol_long_term_mean:.0%}")
     
-    # Feature names for display (with regime)
+    # Feature names for display
     feature_names = [
         "spot_norm", "tte", "delta", "gamma",
-        "vega", "theta", "position", "pnl", "regime"
+        "vega", "theta", "position", "pnl", "regime", "iv"
     ]
     
-    print("\n" + "-" * 60)
-    print("EPISODE SIMULATION (Random Agent with Regimes)")
-    print("-" * 60)
+    print("\n" + "-" * 70)
+    print("EPISODE SIMULATION (Random Agent with Regimes + IV)")
+    print("-" * 70)
     
     total_reward = 0
     action_names = {0: "BUY ", 1: "HOLD", 2: "SELL"}
     
-    print(f"\n{'Step':>4} | {'Regime':>5} | {'Action':>4} | {'Spot':>7} | {'OptPrice':>8} | {'Pos':>4} | {'Reward':>8}")
-    print("-" * 70)
+    print(f"\n{'Step':>4} | {'Regime':>5} | {'IV':>6} | {'Action':>4} | {'Spot':>7} | {'OptPrice':>8} | {'Reward':>8}")
+    print("-" * 75)
     
     # Run a short episode
     for step in range(10):
@@ -574,20 +638,22 @@ if __name__ == "__main__":
         total_reward += reward
         
         regime_str = info['regime_name']
-        print(f"{step:>4} | {regime_str:>5} | {action_names[action]:>4} | ${info['spot']:>6.2f} | ${info['option_price']:>7.2f} | {info['position']:>4} | {reward:>+8.4f}")
+        iv_str = info['iv_pct']
+        print(f"{step:>4} | {regime_str:>5} | {iv_str:>6} | {action_names[action]:>4} | ${info['spot']:>6.2f} | ${info['option_price']:>7.2f} | {reward:>+8.4f}")
         
         if terminated or truncated:
             print("\n[Episode ended]")
             break
     
-    print("\n" + "-" * 60)
+    print("\n" + "-" * 70)
     print("FINAL STATE")
-    print("-" * 60)
+    print("-" * 70)
     print(f"  Cash:            ${info['cash']:.2f}")
     print(f"  Position:        {info['position']}")
     print(f"  Portfolio Value: ${info['portfolio_value']:.2f}")
     print(f"  Total Reward:    {total_reward:.4f}")
     print(f"  Final Regime:    {info['regime_name']}")
+    print(f"  Final IV:        {info['iv_pct']}")
     
     print("\n" + "-" * 60)
     print("OBSERVATION BREAKDOWN (Final)")
