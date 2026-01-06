@@ -1,19 +1,26 @@
 """
 MacroOptionsEnv: A Gymnasium environment for Options Trading with RL.
 
-This environment simulates trading a single ATM call option. The agent
-observes market state (price, Greeks) and portfolio state (position, PnL),
-then decides to Buy, Hold, or Sell.
+This environment simulates trading ATM call and put options. The agent
+observes market state (prices, Greeks) and portfolio state (positions, PnL),
+then decides to Buy/Sell calls or puts, or Hold.
 
 State Space:
-    The observation is a vector of 6 continuous features that capture
+    The observation is a vector of continuous features that capture
     everything the agent needs to make trading decisions.
 
 MDP Structure:
-    - State: [spot, tte, delta, gamma, vega, theta, position, pnl]
-    - Action: {0: BUY, 1: HOLD, 2: SELL}
+    - State: [spot, tte, call_greeks, put_greeks, call_pos, put_pos, pnls, regime, iv]
+    - Action: {0: BUY_CALL, 1: BUY_PUT, 2: SELL_CALL, 3: SELL_PUT, 4: HOLD}
     - Reward: Change in portfolio value - transaction costs
-    - Episode: 30 trading days
+    - Episode: 60 trading days (default)
+    
+Educational Note:
+    With both calls and puts, agent can learn:
+    - Hedging (protective puts, covered calls)
+    - Spreads (bull call, bear put, iron condor)
+    - Synthetic positions (synthetic long = long call + short put)
+    - Put-call parity
 """
 
 import gymnasium as gym
@@ -30,32 +37,43 @@ class OptionsEnv(gym.Env):
     """
     Options trading environment for Reinforcement Learning.
     
-    The agent trades a single ATM call option over a 30-day episode.
+    The agent trades both ATM call and put options over a 60-day episode.
     Stock price evolves via Geometric Brownian Motion (GBM).
     
-    Observation Space (8 features):
+    NEW: With both calls AND puts, agent can learn sophisticated strategies:
+        - Hedging: Protective puts, covered calls
+        - Spreads: Bull call, bear put, iron condor, straddles
+        - Synthetics: Synthetic long (call + short put), conversion/reversal
+        - Put-Call Parity: C - P = S - K*e^(-rT)
+    
+    Observation Space (~18 features, dynamically sized):
     ┌────────────────────────────────────────────────────────────────┐
     │ Index │ Feature              │ Description                    │
     ├───────┼──────────────────────┼────────────────────────────────┤
     │   0   │ spot_normalized      │ Stock price / initial price    │
-    │   1   │ time_to_expiry       │ Years remaining (0 to 0.25)    │
-    │   2   │ delta                │ Option delta (-1 to 1)         │
-    │   3   │ gamma                │ Option gamma (≥ 0)             │
-    │   4   │ vega                 │ Option vega (≥ 0)              │
-    │   5   │ theta                │ Option theta (≤ 0 for longs)   │
-    │   6   │ position             │ Current position (-1, 0, +1)   │
-    │   7   │ pnl_normalized       │ Unrealized PnL / initial cash  │
+    │   1   │ time_to_expiry       │ Years remaining                │
+    │   2   │ call_delta           │ Call option delta (0 to 1)     │
+    │   3   │ call_gamma           │ Call option gamma (≥ 0)        │
+    │   4   │ call_vega            │ Call option vega (≥ 0)         │
+    │   5   │ call_theta           │ Call option theta (≤ 0)        │
+    │   6   │ put_delta            │ Put option delta (-1 to 0)     │
+    │   7   │ put_gamma            │ Put option gamma (≥ 0)         │
+    │   8   │ put_vega             │ Put option vega (≥ 0)          │
+    │   9   │ put_theta            │ Put option theta (≤ 0)         │
+    │  10   │ call_position        │ Call position (-1, 0, +1)      │
+    │  11   │ put_position         │ Put position (-1, 0, +1)       │
+    │  12   │ call_pnl_normalized  │ Call PnL / initial cash        │
+    │  13   │ put_pnl_normalized   │ Put PnL / initial cash         │
+    │  14   │ regime               │ Market regime (-1 bear, +1 bull)│
+    │  15   │ implied_volatility   │ Extracted IV (Newton-Raphson)  │
     └────────────────────────────────────────────────────────────────┘
     
-    Why these features?
-        - spot_normalized: Relative price move (1.05 = up 5%)
-        - time_to_expiry: Urgency signal (options decay faster near expiry)
-        - delta: Directional exposure (how much we gain/lose per $1 stock move)
-        - gamma: Convexity (delta changes faster near ATM and expiry)
-        - vega: Vol exposure (profit if IV rises)
-        - theta: Time decay (we're bleeding value each day)
-        - position: What we're holding (context for action)
-        - pnl_normalized: Risk management signal
+    Action Space (5 discrete actions):
+        0: BUY_CALL  - Buy 1 call contract (or close short call)
+        1: BUY_PUT   - Buy 1 put contract (or close short put)
+        2: SELL_CALL - Sell 1 call contract (or close long call)
+        3: SELL_PUT  - Sell 1 put contract (or close long put)
+        4: HOLD      - Do nothing
     """
     
     metadata = {"render_modes": ["human"]}
@@ -164,26 +182,47 @@ class OptionsEnv(gym.Env):
         # gives the RL algorithm a sense of scale.
         
         # Build observation space dynamically based on features enabled
-        # Base: 8 features + optional regime signal + optional IV
+        # Base: 14 features (spot, tte, call_greeks, put_greeks, positions, pnls)
+        # + optional regime signal + optional IV
         obs_low = [
-            0.5,    # spot_normalized: Stock won't drop below 50% in 30 days (usually)
-            0.0,    # time_to_expiry: Can reach 0
-            -1.0,   # delta: Put delta can be -1
-            0.0,    # gamma: Always positive
-            0.0,    # vega: Always positive
-            -50.0,  # theta: Can be very negative near expiry
-            -1.0,   # position: Short 1 contract
-            -1.0,   # pnl_normalized: Can lose up to 100% (margin call)
+            0.5,    # 0: spot_normalized: Stock won't drop below 50%
+            0.0,    # 1: time_to_expiry: Can reach 0
+            # Call Greeks
+            0.0,    # 2: call_delta: Call delta ranges 0 to 1
+            0.0,    # 3: call_gamma: Always positive
+            0.0,    # 4: call_vega: Always positive
+            -50.0,  # 5: call_theta: Can be very negative near expiry
+            # Put Greeks
+            -1.0,   # 6: put_delta: Put delta ranges -1 to 0
+            0.0,    # 7: put_gamma: Always positive
+            0.0,    # 8: put_vega: Always positive
+            -50.0,  # 9: put_theta: Can be very negative near expiry
+            # Positions
+            -1.0,   # 10: call_position: -1 (short), 0 (flat), +1 (long)
+            -1.0,   # 11: put_position: -1 (short), 0 (flat), +1 (long)
+            # PnL
+            -1.0,   # 12: call_pnl_normalized: Can lose up to 100%
+            -1.0,   # 13: put_pnl_normalized: Can lose up to 100%
         ]
         obs_high = [
-            2.0,    # spot_normalized: Stock won't double in 30 days (usually)
-            0.5,    # time_to_expiry: Can be up to 6 months
-            1.0,    # delta: Call delta maxes at 1
-            1.0,    # gamma: Bounded in practice
-            50.0,   # vega: High but bounded
-            0.0,    # theta: Always negative for long options
-            1.0,    # position: Long 1 contract
-            2.0,    # pnl_normalized: Can make up to 200%
+            2.0,    # 0: spot_normalized: Stock won't double
+            0.5,    # 1: time_to_expiry: Can be up to 6 months
+            # Call Greeks
+            1.0,    # 2: call_delta: Call delta maxes at 1
+            1.0,    # 3: call_gamma: Bounded in practice
+            50.0,   # 4: call_vega: High but bounded
+            0.0,    # 5: call_theta: Always negative for long options
+            # Put Greeks
+            0.0,    # 6: put_delta: Put delta maxes at 0
+            1.0,    # 7: put_gamma: Bounded in practice
+            50.0,   # 8: put_vega: High but bounded
+            0.0,    # 9: put_theta: Always negative for long options
+            # Positions
+            1.0,    # 10: call_position: Long 1 contract max
+            1.0,    # 11: put_position: Long 1 contract max
+            # PnL
+            2.0,    # 12: call_pnl_normalized: Can make up to 200%
+            2.0,    # 13: put_pnl_normalized: Can make up to 200%
         ]
         
         # Add regime signal if using regimes
@@ -205,11 +244,13 @@ class OptionsEnv(gym.Env):
         # =====================================================================
         # Define Action Space
         # =====================================================================
-        # Discrete: 0 = BUY, 1 = HOLD, 2 = SELL
-        self.action_space = spaces.Discrete(3)
-        self.ACTION_BUY = 0
-        self.ACTION_HOLD = 1
-        self.ACTION_SELL = 2
+        # Discrete: 0 = BUY_CALL, 1 = BUY_PUT, 2 = SELL_CALL, 3 = SELL_PUT, 4 = HOLD
+        self.action_space = spaces.Discrete(5)
+        self.ACTION_BUY_CALL = 0
+        self.ACTION_BUY_PUT = 1
+        self.ACTION_SELL_CALL = 2
+        self.ACTION_SELL_PUT = 3
+        self.ACTION_HOLD = 4
         
         # =====================================================================
         # Initialize State Variables (will be set in reset())
@@ -217,11 +258,22 @@ class OptionsEnv(gym.Env):
         self.spot = initial_spot
         self.tte = time_to_expiry
         self.cash = initial_cash
-        self.position = 0           # -1, 0, or +1 contracts
-        self.entry_price = 0.0      # Price we bought/sold at
+        
+        # NEW: Separate positions for calls and puts
+        self.call_position = 0      # -1, 0, or +1 contracts
+        self.put_position = 0       # -1, 0, or +1 contracts
+        self.call_entry_price = 0.0 # Price we bought/sold call at
+        self.put_entry_price = 0.0  # Price we bought/sold put at
+        
+        # NEW: Bond investment (uninvested cash earns risk-free rate)
+        # This represents cash sitting in a money market account
+        self.total_interest_earned = 0.0  # Cumulative interest from bonds
+        
         self.step_count = 0
-        self.option_price = 0.0
-        self.greeks = {}
+        self.call_price = 0.0
+        self.put_price = 0.0
+        self.call_greeks = {}
+        self.put_greeks = {}
         
         # NEW: Market regime (1 = bull, -1 = bear)
         self.regime = 1  # Start in bull market
@@ -235,20 +287,20 @@ class OptionsEnv(gym.Env):
         
         REAL-LIFE WORKFLOW:
         ===================
-        1. Market maker prices option using true_volatility (hidden)
-        2. Agent sees market_price on screen
-        3. Agent uses Newton-Raphson to extract implied_volatility
-        4. Agent computes Greeks using extracted IV
+        1. Market maker prices BOTH call and put using true_volatility (hidden)
+        2. Agent sees market_prices on screen
+        3. Agent uses Newton-Raphson to extract implied_volatility (from call price)
+        4. Agent computes Greeks for BOTH call and put using extracted IV
         5. Agent makes decisions based on extracted IV, NOT true vol
         
         This is realistic - in real life you never know the "true" volatility!
         """
         # =====================================================================
-        # STEP 1: Market maker prices using TRUE volatility (hidden from agent)
+        # STEP 1: Market maker prices BOTH options using TRUE volatility
         # =====================================================================
         if self.use_stochastic_vol:
-            # Market price is set by the "market maker" using true vol
-            self.option_price = self.bsm.price_option(
+            # Market prices are set by the "market maker" using true vol
+            self.call_price = self.bsm.price_option(
                 spot=self.spot,
                 strike=self.strike,
                 time_to_maturity=max(self.tte, 0.001),
@@ -257,26 +309,45 @@ class OptionsEnv(gym.Env):
                 option_type="call"
             )
             
-            # =====================================================================
-            # STEP 2: Agent extracts IV using Newton-Raphson (REAL-LIFE PROCESS)
-            # =====================================================================
-            self._extract_implied_volatility()
-            
-            # =====================================================================
-            # STEP 3: Agent computes Greeks using EXTRACTED IV
-            # =====================================================================
-            # Agent uses their extracted IV estimate to compute Greeks
-            self.greeks = self.bsm.price_and_greeks(
+            self.put_price = self.bsm.price_option(
                 spot=self.spot,
                 strike=self.strike,
                 time_to_maturity=max(self.tte, 0.001),
                 rate=self.rate,
-                volatility=self.implied_volatility,  # EXTRACTED IV - this is what agent knows
+                volatility=self.true_volatility,  # TRUE vol - agent doesn't see this
+                option_type="put"
+            )
+            
+            # =====================================================================
+            # STEP 2: Agent extracts IV using Newton-Raphson (REAL-LIFE PROCESS)
+            # =====================================================================
+            # Extract IV from call price (could also use put price)
+            self._extract_implied_volatility()
+            
+            # =====================================================================
+            # STEP 3: Agent computes Greeks for BOTH using EXTRACTED IV
+            # =====================================================================
+            # Agent uses their extracted IV estimate to compute Greeks
+            self.call_greeks = self.bsm.price_and_greeks(
+                spot=self.spot,
+                strike=self.strike,
+                time_to_maturity=max(self.tte, 0.001),
+                rate=self.rate,
+                volatility=self.implied_volatility,  # EXTRACTED IV
                 option_type="call"
+            )
+            
+            self.put_greeks = self.bsm.price_and_greeks(
+                spot=self.spot,
+                strike=self.strike,
+                time_to_maturity=max(self.tte, 0.001),
+                rate=self.rate,
+                volatility=self.implied_volatility,  # EXTRACTED IV
+                option_type="put"
             )
         else:
             # No stochastic vol: use fixed volatility
-            self.greeks = self.bsm.price_and_greeks(
+            self.call_greeks = self.bsm.price_and_greeks(
                 spot=self.spot,
                 strike=self.strike,
                 time_to_maturity=max(self.tte, 0.001),
@@ -284,35 +355,61 @@ class OptionsEnv(gym.Env):
                 volatility=self.initial_volatility,
                 option_type="call"
             )
-            self.option_price = self.greeks["price"]
+            self.call_price = self.call_greeks["price"]
+            
+            self.put_greeks = self.bsm.price_and_greeks(
+                spot=self.spot,
+                strike=self.strike,
+                time_to_maturity=max(self.tte, 0.001),
+                rate=self.rate,
+                volatility=self.initial_volatility,
+                option_type="put"
+            )
+            self.put_price = self.put_greeks["price"]
         
-        # Calculate unrealized PnL
-        if self.position != 0:
-            # Mark-to-market: what's our position worth now?
-            unrealized_pnl = self.position * (self.option_price - self.entry_price) * 100
+        # Calculate unrealized PnL for both call and put positions
+        if self.call_position != 0:
+            # Mark-to-market: what's our call position worth now?
+            call_unrealized_pnl = self.call_position * (self.call_price - self.call_entry_price) * 100
         else:
-            unrealized_pnl = 0.0
+            call_unrealized_pnl = 0.0
+            
+        if self.put_position != 0:
+            # Mark-to-market: what's our put position worth now?
+            put_unrealized_pnl = self.put_position * (self.put_price - self.put_entry_price) * 100
+        else:
+            put_unrealized_pnl = 0.0
         
         # Construct observation vector
         base_obs = [
-            self.spot / self.initial_spot,           # Normalized spot
-            self.tte,                                 # Time to expiry
-            self.greeks["delta"],                     # Delta
-            self.greeks["gamma"],                     # Gamma
-            self.greeks["vega"] / 100.0,              # Vega (scaled down)
-            self.greeks["theta"] / 100.0,             # Theta (scaled down)
-            float(self.position),                     # Position
-            unrealized_pnl / self.initial_cash,       # Normalized PnL
+            self.spot / self.initial_spot,              # 0: Normalized spot
+            self.tte,                                    # 1: Time to expiry
+            # Call Greeks
+            self.call_greeks["delta"],                   # 2: Call delta
+            self.call_greeks["gamma"],                   # 3: Call gamma
+            self.call_greeks["vega"] / 100.0,            # 4: Call vega (scaled)
+            self.call_greeks["theta"] / 100.0,           # 5: Call theta (scaled)
+            # Put Greeks
+            self.put_greeks["delta"],                    # 6: Put delta
+            self.put_greeks["gamma"],                    # 7: Put gamma
+            self.put_greeks["vega"] / 100.0,             # 8: Put vega (scaled)
+            self.put_greeks["theta"] / 100.0,            # 9: Put theta (scaled)
+            # Positions
+            float(self.call_position),                   # 10: Call position
+            float(self.put_position),                    # 11: Put position
+            # PnL
+            call_unrealized_pnl / self.initial_cash,     # 12: Call PnL normalized
+            put_unrealized_pnl / self.initial_cash,      # 13: Put PnL normalized
         ]
         
         # Add regime signal if using regimes
         if self.use_regime:
-            base_obs.append(float(self.regime))      # -1 = bear, +1 = bull
+            base_obs.append(float(self.regime))          # 14: -1 = bear, +1 = bull
         
         # Add EXTRACTED IV if using stochastic volatility
         # Agent sees their Newton-Raphson extracted IV, NOT the true vol!
         if self.use_stochastic_vol:
-            base_obs.append(self.implied_volatility)  # EXTRACTED IV (via Newton-Raphson)
+            base_obs.append(self.implied_volatility)     # 15: EXTRACTED IV
         
         obs = np.array(base_obs, dtype=np.float32)
         
@@ -322,6 +419,8 @@ class OptionsEnv(gym.Env):
         """
         Return auxiliary information (not used by agent, but useful for debugging).
         
+        NEW: With both calls and puts, we track separate prices, positions, and Greeks.
+        
         REAL-LIFE SETUP:
         - true_vol: Hidden volatility (market maker's secret)
         - implied_vol: What agent extracted using Newton-Raphson
@@ -329,12 +428,25 @@ class OptionsEnv(gym.Env):
         """
         iv_error = abs(self.true_volatility - self.implied_volatility) if self.use_stochastic_vol else 0.0
         
+        # Calculate portfolio delta for debugging
+        call_delta = self.call_greeks.get("delta", 0.5)
+        put_delta = self.put_greeks.get("delta", -0.5)
+        portfolio_delta = self.call_position * call_delta + self.put_position * put_delta
+        
         return {
             "spot": self.spot,
-            "option_price": self.option_price,
-            "position": self.position,
+            # Call info
+            "call_price": self.call_price,
+            "call_position": self.call_position,
+            "call_greeks": self.call_greeks,
+            # Put info
+            "put_price": self.put_price,
+            "put_position": self.put_position,
+            "put_greeks": self.put_greeks,
+            # Portfolio info
+            "portfolio_delta": portfolio_delta,
             "cash": self.cash,
-            "greeks": self.greeks,
+            "total_interest_earned": self.total_interest_earned,  # NEW: Bond interest
             "step": self.step_count,
             "tte": self.tte,
             "regime": self.regime,
@@ -369,8 +481,16 @@ class OptionsEnv(gym.Env):
         self.spot = self.initial_spot
         self.tte = self.initial_tte
         self.cash = self.initial_cash
-        self.position = 0
-        self.entry_price = 0.0
+        
+        # NEW: Reset separate call and put positions
+        self.call_position = 0
+        self.put_position = 0
+        self.call_entry_price = 0.0
+        self.put_entry_price = 0.0
+        
+        # NEW: Reset bond interest tracker
+        self.total_interest_earned = 0.0
+        
         self.step_count = 0
         
         # Reset market regime (random start: 50% bull, 50% bear)
@@ -444,7 +564,7 @@ class OptionsEnv(gym.Env):
         NEWTON-RAPHSON IV EXTRACTION (Real-Life Workflow)
         
         This is what traders actually do:
-        1. See a market price on their screen
+        1. See a market price on their screen (call price)
         2. Use numerical methods to find the IV that matches the price
         3. Make trading decisions based on extracted IV
         
@@ -454,24 +574,18 @@ class OptionsEnv(gym.Env):
         
         The agent NEVER sees:
         - The true_volatility (that's the market maker's secret)
+        
+        Note: We extract IV from the call price. By put-call parity, the put
+        price should imply the same IV (up to numerical error).
         """
         if not self.use_stochastic_vol:
             return self.initial_volatility
         
-        # Compute market price using TRUE volatility (market maker's price)
-        market_price = self.bsm.price_option(
-            spot=self.spot,
-            strike=self.strike,
-            time_to_maturity=max(self.tte, 0.001),
-            rate=self.rate,
-            volatility=self.true_volatility,
-            option_type="call"
-        )
-        
+        # Use the call market price (already computed in _get_observation)
         # Agent uses Newton-Raphson to EXTRACT IV from market price
         # This is the real-life process!
         extracted_iv, converged = self.bsm.implied_volatility(
-            market_price=market_price,
+            market_price=self.call_price,  # Market maker's call price (using true_volatility)
             spot=self.spot,
             strike=self.strike,
             time_to_maturity=max(self.tte, 0.001),
@@ -549,51 +663,98 @@ class OptionsEnv(gym.Env):
         """
         Execute a trading action and return the transaction cost.
         
+        NEW: With both calls and puts, we have 5 actions:
+        
         Actions:
-            0 (BUY):  If flat → go long 1 contract
-                      If short → close short (buy back)
-                      If long → do nothing (already long)
+            0 (BUY_CALL):  If flat → go long 1 call
+                           If short call → close short call
+                           If long call → do nothing
             
-            1 (HOLD): Do nothing
+            1 (BUY_PUT):   If flat → go long 1 put
+                           If short put → close short put
+                           If long put → do nothing
             
-            2 (SELL): If flat → go short 1 contract
-                      If long → close long (sell)
-                      If short → do nothing (already short)
+            2 (SELL_CALL): If flat → go short 1 call
+                           If long call → close long call
+                           If short call → do nothing
+            
+            3 (SELL_PUT):  If flat → go short 1 put
+                           If long put → close long put
+                           If short put → do nothing
+            
+            4 (HOLD):      Do nothing
         
         Returns:
             Transaction cost incurred (0 if no trade)
+            
+        Educational Note:
+            - BUY_CALL + BUY_PUT = Long Straddle (profit from big moves either way)
+            - SELL_CALL + BUY_PUT = Protective Put (downside protection)
+            - BUY_CALL + SELL_PUT = Synthetic Long (replicates long stock)
         """
         transaction_cost = 0.0
         
-        if action == self.ACTION_BUY:
-            if self.position <= 0:  # Flat or short → buy
-                # Close any short position first
-                if self.position == -1:
-                    # Buying back short: pay the ask price
-                    buy_price = self.option_price * (1 + self.transaction_cost / 2)
-                    pnl = (self.entry_price - buy_price) * 100  # Short profit/loss
+        # ====================== CALL ACTIONS ======================
+        if action == self.ACTION_BUY_CALL:
+            if self.call_position <= 0:  # Flat or short → buy
+                # Close any short call position first
+                if self.call_position == -1:
+                    # Buying back short call: pay the ask price
+                    buy_price = self.call_price * (1 + self.transaction_cost / 2)
+                    pnl = (self.call_entry_price - buy_price) * 100  # Short profit/loss
                     self.cash += pnl
-                    transaction_cost = self.option_price * self.transaction_cost / 2 * 100
+                    transaction_cost = self.call_price * self.transaction_cost / 2 * 100
                 
-                # Go long
-                self.position = 1
-                self.entry_price = self.option_price * (1 + self.transaction_cost / 2)
-                transaction_cost += self.option_price * self.transaction_cost / 2 * 100
+                # Go long call
+                self.call_position = 1
+                self.call_entry_price = self.call_price * (1 + self.transaction_cost / 2)
+                transaction_cost += self.call_price * self.transaction_cost / 2 * 100
                 
-        elif action == self.ACTION_SELL:
-            if self.position >= 0:  # Flat or long → sell
-                # Close any long position first
-                if self.position == 1:
-                    # Selling long: receive the bid price
-                    sell_price = self.option_price * (1 - self.transaction_cost / 2)
-                    pnl = (sell_price - self.entry_price) * 100  # Long profit/loss
+        elif action == self.ACTION_SELL_CALL:
+            if self.call_position >= 0:  # Flat or long → sell
+                # Close any long call position first
+                if self.call_position == 1:
+                    # Selling long call: receive the bid price
+                    sell_price = self.call_price * (1 - self.transaction_cost / 2)
+                    pnl = (sell_price - self.call_entry_price) * 100  # Long profit/loss
                     self.cash += pnl
-                    transaction_cost = self.option_price * self.transaction_cost / 2 * 100
+                    transaction_cost = self.call_price * self.transaction_cost / 2 * 100
                 
-                # Go short
-                self.position = -1
-                self.entry_price = self.option_price * (1 - self.transaction_cost / 2)
-                transaction_cost += self.option_price * self.transaction_cost / 2 * 100
+                # Go short call
+                self.call_position = -1
+                self.call_entry_price = self.call_price * (1 - self.transaction_cost / 2)
+                transaction_cost += self.call_price * self.transaction_cost / 2 * 100
+        
+        # ====================== PUT ACTIONS ======================
+        elif action == self.ACTION_BUY_PUT:
+            if self.put_position <= 0:  # Flat or short → buy
+                # Close any short put position first
+                if self.put_position == -1:
+                    # Buying back short put: pay the ask price
+                    buy_price = self.put_price * (1 + self.transaction_cost / 2)
+                    pnl = (self.put_entry_price - buy_price) * 100  # Short profit/loss
+                    self.cash += pnl
+                    transaction_cost = self.put_price * self.transaction_cost / 2 * 100
+                
+                # Go long put
+                self.put_position = 1
+                self.put_entry_price = self.put_price * (1 + self.transaction_cost / 2)
+                transaction_cost += self.put_price * self.transaction_cost / 2 * 100
+                
+        elif action == self.ACTION_SELL_PUT:
+            if self.put_position >= 0:  # Flat or long → sell
+                # Close any long put position first
+                if self.put_position == 1:
+                    # Selling long put: receive the bid price
+                    sell_price = self.put_price * (1 - self.transaction_cost / 2)
+                    pnl = (sell_price - self.put_entry_price) * 100  # Long profit/loss
+                    self.cash += pnl
+                    transaction_cost = self.put_price * self.transaction_cost / 2 * 100
+                
+                # Go short put
+                self.put_position = -1
+                self.put_entry_price = self.put_price * (1 - self.transaction_cost / 2)
+                transaction_cost += self.put_price * self.transaction_cost / 2 * 100
         
         # ACTION_HOLD: do nothing, transaction_cost stays 0
         
@@ -601,14 +762,18 @@ class OptionsEnv(gym.Env):
     
     def _calculate_portfolio_value(self) -> float:
         """
-        Calculate current portfolio value (cash + mark-to-market position).
+        Calculate current portfolio value (cash + mark-to-market positions).
         
-        Portfolio Value = Cash + Position * Current Option Price * 100
+        Portfolio Value = Cash + Call Position Value + Put Position Value
         
+        Position Value = Position * Current Option Price * 100
         The *100 is because one option contract = 100 shares.
+        
+        NEW: With both calls and puts, we need to sum both position values.
         """
-        position_value = self.position * self.option_price * 100
-        return self.cash + position_value
+        call_position_value = self.call_position * self.call_price * 100
+        put_position_value = self.put_position * self.put_price * 100
+        return self.cash + call_position_value + put_position_value
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
@@ -646,6 +811,13 @@ class OptionsEnv(gym.Env):
         self._simulate_price_movement()
         self.step_count += 1
         
+        # 3.5 NEW: Accrue interest on uninvested cash (money market account)
+        # Cash earns risk-free rate per day: r_daily = r_annual / 252
+        # This is realistic - brokers automatically sweep idle cash into money market funds
+        daily_interest = self.cash * (self.rate / 252)
+        self.cash += daily_interest
+        self.total_interest_earned += daily_interest
+        
         # 4. Get new observation (also updates self.option_price)
         obs = self._get_observation()
         
@@ -658,7 +830,7 @@ class OptionsEnv(gym.Env):
         raw_pnl = value_after - value_before
         reward = (raw_pnl - transaction_cost) / self.initial_cash
         
-        # Track reward components for debugging
+         # Track reward components for debugging
         reward_components = {
             "base_pnl": reward,
             "regime_penalty": 0.0,
@@ -668,26 +840,36 @@ class OptionsEnv(gym.Env):
         
         # Regime-conditional penalty
         # Penalize positions that go against the market regime
+        # NEW: Check both call and put positions
         if self.use_regime:
-            # Long in bear market = bad (losing money fighting the trend)
-            if self.position == 1 and self.regime == -1:
+            # Long calls in bear market = bad (losing money fighting the trend)
+            if self.call_position == 1 and self.regime == -1:
                 reward -= 0.005
                 reward_components["regime_penalty"] = -0.005
-            # Short in bull market = bad (missing the upside)
-            elif self.position == -1 and self.regime == 1:
+            # Short calls in bull market = bad (missing the upside)
+            elif self.call_position == -1 and self.regime == 1:
                 reward -= 0.005
                 reward_components["regime_penalty"] = -0.005
+            # Long puts in bull market = bad (puts lose value in bull markets)
+            if self.put_position == 1 and self.regime == 1:
+                reward -= 0.005
+                reward_components["regime_penalty"] -= 0.005
+            # Short puts in bear market = bad (puts gain value in bear markets)
+            elif self.put_position == -1 and self.regime == -1:
+                reward -= 0.005
+                reward_components["regime_penalty"] -= 0.005
         
         # =====================================================================
         # REWARD SHAPING: Encourage sophisticated trading behavior
         # =====================================================================
         if self.use_reward_shaping:
             # 1. DELTA PENALTY: Encourage delta-neutral positions (hedging)
-            # Portfolio delta = position * option_delta
-            # If long: portfolio_delta = +delta (typically 0.3 to 0.7)
-            # If short: portfolio_delta = -delta
-            # If flat: portfolio_delta = 0
-            portfolio_delta = self.position * self.greeks.get("delta", 0.5)
+            # Portfolio delta = call_position * call_delta + put_position * put_delta
+            # Example: Long call (delta=0.5) + Long put (delta=-0.5) = Delta-neutral straddle
+            # Example: Long call (delta=0.5) + Short put (delta=-0.5, position=-1) = Synthetic long (delta~1)
+            call_delta = self.call_greeks.get("delta", 0.5)
+            put_delta = self.put_greeks.get("delta", -0.5)
+            portfolio_delta = self.call_position * call_delta + self.put_position * put_delta
             delta_penalty = -self.delta_penalty_weight * abs(portfolio_delta)
             reward += delta_penalty
             reward_components["delta_penalty"] = delta_penalty
@@ -697,13 +879,13 @@ class OptionsEnv(gym.Env):
             current_iv = self.implied_volatility
             
             # Penalize buying when IV is high (options are expensive)
-            if action == 0 and current_iv > self.iv_threshold:  # BUY action
+            if action in [self.ACTION_BUY_CALL, self.ACTION_BUY_PUT] and current_iv > self.iv_threshold:
                 iv_penalty = -self.iv_penalty_weight
                 reward += iv_penalty
                 reward_components["iv_penalty"] = iv_penalty
             
             # Reward selling when IV is high (collect premium)
-            elif action == 2 and current_iv > self.iv_threshold:  # SELL action
+            elif action in [self.ACTION_SELL_CALL, self.ACTION_SELL_PUT] and current_iv > self.iv_threshold:
                 iv_bonus = self.iv_bonus_weight
                 reward += iv_bonus
                 reward_components["iv_penalty"] = iv_bonus  # Stored as positive
@@ -716,25 +898,46 @@ class OptionsEnv(gym.Env):
         # a) We've reached the episode length
         if self.step_count >= self.episode_length:
             truncated = True
-            # Force close any open position at episode end
-            if self.position != 0:
-                close_cost = self.option_price * self.transaction_cost / 2 * 100
-                if self.position == 1:
-                    self.cash += (self.option_price - self.entry_price) * 100 - close_cost
+            # Force close any open positions at episode end
+            # NEW: Close both call and put positions
+            if self.call_position != 0:
+                close_cost = self.call_price * self.transaction_cost / 2 * 100
+                if self.call_position == 1:
+                    self.cash += (self.call_price - self.call_entry_price) * 100 - close_cost
                 else:
-                    self.cash += (self.entry_price - self.option_price) * 100 - close_cost
-                self.position = 0
+                    self.cash += (self.call_entry_price - self.call_price) * 100 - close_cost
+                self.call_position = 0
+            
+            if self.put_position != 0:
+                close_cost = self.put_price * self.transaction_cost / 2 * 100
+                if self.put_position == 1:
+                    self.cash += (self.put_price - self.put_entry_price) * 100 - close_cost
+                else:
+                    self.cash += (self.put_entry_price - self.put_price) * 100 - close_cost
+                self.put_position = 0
         
-        # b) Option expired (time to expiry reached 0)
+        # b) Options expired (time to expiry reached 0)
         if self.tte <= 0.001:
             terminated = True
-            # At expiration: call is worth max(S - K, 0)
-            intrinsic = max(0, self.spot - self.strike)
-            if self.position == 1:
-                self.cash += (intrinsic - self.entry_price) * 100
-            elif self.position == -1:
-                self.cash += (self.entry_price - intrinsic) * 100
-            self.position = 0
+            # At expiration: 
+            # Call is worth max(S - K, 0)
+            # Put is worth max(K - S, 0)
+            call_intrinsic = max(0, self.spot - self.strike)
+            put_intrinsic = max(0, self.strike - self.spot)
+            
+            # Settle call position
+            if self.call_position == 1:
+                self.cash += (call_intrinsic - self.call_entry_price) * 100
+            elif self.call_position == -1:
+                self.cash += (self.call_entry_price - call_intrinsic) * 100
+            self.call_position = 0
+            
+            # Settle put position
+            if self.put_position == 1:
+                self.cash += (put_intrinsic - self.put_entry_price) * 100
+            elif self.put_position == -1:
+                self.cash += (self.put_entry_price - put_intrinsic) * 100
+            self.put_position = 0
         
         # 8. Get info
         info = self._get_info()

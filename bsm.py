@@ -279,6 +279,7 @@ def implied_volatility(
     return sigma.detach(), False
 
 
+
 # =============================================================================
 # Convenience class wrapping all functionality
 # =============================================================================
