@@ -61,6 +61,8 @@ def run_episode(env, model, seed=None, deterministic=True):
     """
     Run one episode and record all data.
     
+    NEW: Updated for call/put environment with 5 actions.
+    
     Returns:
         dict with episode data:
             - observations: list of state vectors
@@ -71,15 +73,25 @@ def run_episode(env, model, seed=None, deterministic=True):
     """
     obs, info = env.reset(seed=seed)
     
+    # Calculate initial portfolio value
+    initial_value = info["cash"]
+    
     data = {
         "observations": [obs.copy()],
         "actions": [],
         "rewards": [],
         "infos": [info.copy()],
         "spots": [info["spot"]],
-        "option_prices": [info["option_price"]],
-        "positions": [info["position"]],
-        "portfolio_values": [info["cash"]],
+        # NEW: Track both call and put prices
+        "call_prices": [info["call_price"]],
+        "put_prices": [info["put_price"]],
+        # NEW: Track both positions
+        "call_positions": [info["call_position"]],
+        "put_positions": [info["put_position"]],
+        "portfolio_deltas": [info["portfolio_delta"]],
+        "portfolio_values": [initial_value],
+        "regimes": [info["regime"]],
+        "interest_earned": [info.get("total_interest_earned", 0)],
     }
     
     done = False
@@ -88,14 +100,24 @@ def run_episode(env, model, seed=None, deterministic=True):
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
+        # Calculate portfolio value (cash + positions)
+        call_value = info["call_position"] * info["call_price"] * 100
+        put_value = info["put_position"] * info["put_price"] * 100
+        portfolio_value = info["cash"] + call_value + put_value
+        
         data["observations"].append(obs.copy())
         data["actions"].append(int(action))
         data["rewards"].append(reward)
         data["infos"].append(info.copy())
         data["spots"].append(info["spot"])
-        data["option_prices"].append(info["option_price"])
-        data["positions"].append(info["position"])
-        data["portfolio_values"].append(info["portfolio_value"])
+        data["call_prices"].append(info["call_price"])
+        data["put_prices"].append(info["put_price"])
+        data["call_positions"].append(info["call_position"])
+        data["put_positions"].append(info["put_position"])
+        data["portfolio_deltas"].append(info["portfolio_delta"])
+        data["portfolio_values"].append(portfolio_value)
+        data["regimes"].append(info["regime"])
+        data["interest_earned"].append(info.get("total_interest_earned", 0))
     
     data["total_reward"] = sum(data["rewards"])
     return data
@@ -105,9 +127,10 @@ def run_random_episode(env, seed=None):
     """Run one episode with random actions."""
     obs, info = env.reset(seed=seed)
     
+    initial_value = info["cash"]
     data = {
         "rewards": [],
-        "portfolio_values": [info["cash"]],
+        "portfolio_values": [initial_value],
     }
     
     done = False
@@ -116,8 +139,13 @@ def run_random_episode(env, seed=None):
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
+        # Calculate portfolio value
+        call_value = info["call_position"] * info["call_price"] * 100
+        put_value = info["put_position"] * info["put_price"] * 100
+        portfolio_value = info["cash"] + call_value + put_value
+        
         data["rewards"].append(reward)
-        data["portfolio_values"].append(info["portfolio_value"])
+        data["portfolio_values"].append(portfolio_value)
     
     data["total_reward"] = sum(data["rewards"])
     return data
@@ -129,68 +157,84 @@ def run_random_episode(env, seed=None):
 
 def plot_episode_trajectory(data, title="Episode Trajectory"):
     """
-    Plot a single episode showing stock, option, position, and portfolio.
+    Plot a single episode showing stock, options, positions, and portfolio.
+    NEW: Updated for call/put environment.
     """
-    fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(14, 14), sharex=True)
     
     steps = range(len(data["spots"]))
     
-    # Plot 1: Stock and Option Price
+    # Plot 1: Stock and Option Prices
     ax1 = axes[0]
     ax1.plot(steps, data["spots"], 'b-', linewidth=2, label="Stock Price")
     ax1.set_ylabel("Stock Price ($)", color='blue')
     ax1.tick_params(axis='y', labelcolor='blue')
-    ax1.legend(loc='upper left')
     ax1.set_title(title)
     ax1.grid(True, alpha=0.3)
     
+    # Add regime background
+    for i, regime in enumerate(data["regimes"]):
+        color = 'lightgreen' if regime == 1 else 'lightcoral'
+        ax1.axvspan(i - 0.5, i + 0.5, alpha=0.2, color=color)
+    
     ax1b = ax1.twinx()
-    ax1b.plot(steps, data["option_prices"], 'g-', linewidth=2, label="Option Price")
-    ax1b.set_ylabel("Option Price ($)", color='green')
-    ax1b.tick_params(axis='y', labelcolor='green')
+    ax1b.plot(steps, data["call_prices"], 'g-', linewidth=2, label="Call Price", alpha=0.8)
+    ax1b.plot(steps, data["put_prices"], 'r-', linewidth=2, label="Put Price", alpha=0.8)
+    ax1b.set_ylabel("Option Price ($)")
     ax1b.legend(loc='upper right')
     
-    # Plot 2: Position and Actions
+    ax1.legend(loc='upper left')
+    
+    # Plot 2: Call and Put Positions
     ax2 = axes[1]
-    position_colors = {-1: 'red', 0: 'gray', 1: 'green'}
-    colors = [position_colors[p] for p in data["positions"]]
-    ax2.bar(steps, data["positions"], color=colors, alpha=0.7)
+    width = 0.35
+    x = np.array(list(steps))
+    ax2.bar(x - width/2, data["call_positions"], width, label='Call Position', color='blue', alpha=0.7)
+    ax2.bar(x + width/2, data["put_positions"], width, label='Put Position', color='orange', alpha=0.7)
     ax2.set_ylabel("Position")
     ax2.set_yticks([-1, 0, 1])
     ax2.set_yticklabels(["Short", "Flat", "Long"])
+    ax2.legend()
     ax2.grid(True, alpha=0.3)
+    ax2.set_title("Positions (Call=Blue, Put=Orange)")
     
-    # Add action markers
-    action_markers = {0: '^', 1: 's', 2: 'v'}  # BUY, HOLD, SELL
-    action_colors = {0: 'green', 1: 'gray', 2: 'red'}
-    for i, action in enumerate(data["actions"]):
-        ax2.scatter(i + 1, data["positions"][i + 1], 
-                   marker=action_markers[action], 
-                   color=action_colors[action],
-                   s=100, zorder=5)
-    
-    # Plot 3: Rewards
+    # Plot 3: Portfolio Delta
     ax3 = axes[2]
-    reward_colors = ['green' if r >= 0 else 'red' for r in data["rewards"]]
-    ax3.bar(range(1, len(data["rewards"]) + 1), data["rewards"], color=reward_colors, alpha=0.7)
-    ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-    ax3.set_ylabel("Reward")
+    delta_colors = ['green' if d >= 0 else 'red' for d in data["portfolio_deltas"]]
+    ax3.bar(steps, data["portfolio_deltas"], color=delta_colors, alpha=0.7)
+    ax3.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax3.set_ylabel("Portfolio Delta")
     ax3.grid(True, alpha=0.3)
+    ax3.set_title("Portfolio Delta (Green=Bullish, Red=Bearish)")
     
-    # Plot 4: Portfolio Value
+    # Plot 4: Rewards
     ax4 = axes[3]
-    ax4.plot(steps, data["portfolio_values"], 'purple', linewidth=2)
-    ax4.axhline(y=10000, color='gray', linestyle='--', linewidth=1, label="Initial")
-    ax4.fill_between(steps, 10000, data["portfolio_values"], 
+    reward_colors = ['green' if r >= 0 else 'red' for r in data["rewards"]]
+    ax4.bar(range(1, len(data["rewards"]) + 1), data["rewards"], color=reward_colors, alpha=0.7)
+    ax4.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax4.set_ylabel("Reward")
+    ax4.grid(True, alpha=0.3)
+    
+    # Plot 5: Portfolio Value and Interest
+    ax5 = axes[4]
+    ax5.plot(steps, data["portfolio_values"], 'purple', linewidth=2, label="Portfolio Value")
+    ax5.axhline(y=10000, color='gray', linestyle='--', linewidth=1, label="Initial")
+    ax5.fill_between(steps, 10000, data["portfolio_values"], 
                      where=[v >= 10000 for v in data["portfolio_values"]], 
                      color='green', alpha=0.3)
-    ax4.fill_between(steps, 10000, data["portfolio_values"],
+    ax5.fill_between(steps, 10000, data["portfolio_values"],
                      where=[v < 10000 for v in data["portfolio_values"]],
                      color='red', alpha=0.3)
-    ax4.set_ylabel("Portfolio Value ($)")
-    ax4.set_xlabel("Step (Day)")
-    ax4.legend(loc='upper left')
-    ax4.grid(True, alpha=0.3)
+    ax5.set_ylabel("Portfolio Value ($)")
+    ax5.set_xlabel("Step (Day)")
+    ax5.legend(loc='upper left')
+    ax5.grid(True, alpha=0.3)
+    
+    # Add interest earned annotation
+    final_interest = data["interest_earned"][-1] if data["interest_earned"] else 0
+    ax5.annotate(f'Interest Earned: ${final_interest:.2f}', 
+                xy=(0.02, 0.95), xycoords='axes fraction',
+                fontsize=10, color='blue')
     
     plt.tight_layout()
     return fig
@@ -199,27 +243,45 @@ def plot_episode_trajectory(data, title="Episode Trajectory"):
 def plot_action_distribution(episodes_data):
     """
     Plot distribution of actions taken by the agent.
+    NEW: Updated for 5-action environment (calls + puts).
     """
     all_actions = []
     for data in episodes_data:
         all_actions.extend(data["actions"])
     
-    action_counts = [all_actions.count(0), all_actions.count(1), all_actions.count(2)]
-    action_labels = ["BUY", "HOLD", "SELL"]
-    colors = ['green', 'gray', 'red']
+    action_counts = [
+        all_actions.count(0),  # BUY_CALL
+        all_actions.count(1),  # BUY_PUT
+        all_actions.count(2),  # SELL_CALL
+        all_actions.count(3),  # SELL_PUT
+        all_actions.count(4),  # HOLD
+    ]
+    action_labels = ["BUY\nCALL", "BUY\nPUT", "SELL\nCALL", "SELL\nPUT", "HOLD"]
+    colors = ['limegreen', 'lightgreen', 'red', 'lightcoral', 'gray']
     
-    fig, ax = plt.subplots(figsize=(8, 5))
-    bars = ax.bar(action_labels, action_counts, color=colors, alpha=0.7, edgecolor='black')
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(action_labels, action_counts, color=colors, alpha=0.8, edgecolor='black')
     
     # Add count labels on bars
+    total = len(all_actions) if len(all_actions) > 0 else 1
     for bar, count in zip(bars, action_counts):
         ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 5,
-               f'{count}\n({count/len(all_actions)*100:.1f}%)', 
-               ha='center', va='bottom', fontsize=12)
+               f'{count}\n({count/total*100:.1f}%)', 
+               ha='center', va='bottom', fontsize=11)
     
     ax.set_ylabel("Count")
-    ax.set_title("Action Distribution Across All Episodes")
+    ax.set_title("Action Distribution (Call=Green tones, Put=Red tones)")
     ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add summary text
+    call_actions = action_counts[0] + action_counts[2]  # BUY_CALL + SELL_CALL
+    put_actions = action_counts[1] + action_counts[3]   # BUY_PUT + SELL_PUT
+    hold_actions = action_counts[4]
+    
+    summary = f"Calls: {call_actions} ({call_actions/total*100:.1f}%) | "
+    summary += f"Puts: {put_actions} ({put_actions/total*100:.1f}%) | "
+    summary += f"Hold: {hold_actions} ({hold_actions/total*100:.1f}%)"
+    ax.set_xlabel(summary)
     
     plt.tight_layout()
     return fig
