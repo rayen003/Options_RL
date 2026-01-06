@@ -81,6 +81,12 @@ class OptionsEnv(gym.Env):
         vol_of_vol: float = 0.30,            # Volatility of volatility (30% annual)
         vol_mean_reversion: float = 2.0,     # Mean reversion speed (higher = faster reversion)
         vol_long_term_mean: float = 0.20,    # Long-term mean volatility (20%)
+        # ==================== Reward Shaping Parameters ====================
+        use_reward_shaping: bool = True,     # Enable advanced reward shaping
+        delta_penalty_weight: float = 0.001, # Penalty for non-neutral delta
+        iv_threshold: float = 0.30,          # IV threshold for expensive options (30%)
+        iv_penalty_weight: float = 0.002,    # Penalty for buying expensive options
+        iv_bonus_weight: float = 0.002,      # Bonus for selling expensive options
     ):
         """
         Initialize the options trading environment.
@@ -132,6 +138,13 @@ class OptionsEnv(gym.Env):
         self.vol_mean_reversion = vol_mean_reversion
         self.vol_long_term_mean = vol_long_term_mean
         self.initial_volatility = volatility  # Store initial vol for reset
+        
+        # Reward shaping parameters
+        self.use_reward_shaping = use_reward_shaping
+        self.delta_penalty_weight = delta_penalty_weight
+        self.iv_threshold = iv_threshold
+        self.iv_penalty_weight = iv_penalty_weight
+        self.iv_bonus_weight = iv_bonus_weight
         
         # REAL-LIFE SETUP:
         # - true_volatility: Hidden vol that market maker uses (agent doesn't see)
@@ -645,15 +658,55 @@ class OptionsEnv(gym.Env):
         raw_pnl = value_after - value_before
         reward = (raw_pnl - transaction_cost) / self.initial_cash
         
-        # NEW: Regime-conditional penalty
+        # Track reward components for debugging
+        reward_components = {
+            "base_pnl": reward,
+            "regime_penalty": 0.0,
+            "delta_penalty": 0.0,
+            "iv_penalty": 0.0,
+        }
+        
+        # Regime-conditional penalty
         # Penalize positions that go against the market regime
         if self.use_regime:
             # Long in bear market = bad (losing money fighting the trend)
             if self.position == 1 and self.regime == -1:
-                reward -= 0.005  # Small penalty per step
+                reward -= 0.005
+                reward_components["regime_penalty"] = -0.005
             # Short in bull market = bad (missing the upside)
             elif self.position == -1 and self.regime == 1:
                 reward -= 0.005
+                reward_components["regime_penalty"] = -0.005
+        
+        # =====================================================================
+        # REWARD SHAPING: Encourage sophisticated trading behavior
+        # =====================================================================
+        if self.use_reward_shaping:
+            # 1. DELTA PENALTY: Encourage delta-neutral positions (hedging)
+            # Portfolio delta = position * option_delta
+            # If long: portfolio_delta = +delta (typically 0.3 to 0.7)
+            # If short: portfolio_delta = -delta
+            # If flat: portfolio_delta = 0
+            portfolio_delta = self.position * self.greeks.get("delta", 0.5)
+            delta_penalty = -self.delta_penalty_weight * abs(portfolio_delta)
+            reward += delta_penalty
+            reward_components["delta_penalty"] = delta_penalty
+            
+            # 2. IV PENALTY/BONUS: Buy cheap options, sell expensive ones
+            # This encourages volatility arbitrage behavior
+            current_iv = self.implied_volatility
+            
+            # Penalize buying when IV is high (options are expensive)
+            if action == 0 and current_iv > self.iv_threshold:  # BUY action
+                iv_penalty = -self.iv_penalty_weight
+                reward += iv_penalty
+                reward_components["iv_penalty"] = iv_penalty
+            
+            # Reward selling when IV is high (collect premium)
+            elif action == 2 and current_iv > self.iv_threshold:  # SELL action
+                iv_bonus = self.iv_bonus_weight
+                reward += iv_bonus
+                reward_components["iv_penalty"] = iv_bonus  # Stored as positive
         
         # 7. Check termination conditions
         terminated = False
@@ -688,6 +741,7 @@ class OptionsEnv(gym.Env):
         info["transaction_cost"] = transaction_cost
         info["reward"] = reward
         info["portfolio_value"] = value_after
+        info["reward_components"] = reward_components  # For debugging reward shaping
         
         return obs, reward, terminated, truncated, info
 

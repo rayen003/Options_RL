@@ -24,21 +24,33 @@ from stable_baselines3 import PPO
 from env import OptionsEnv
 
 
-def create_experiment_dir(base_dir="experiments"):
+def get_experiment_dir_from_model(model_path):
     """
-    Create a unique experiment directory with datetime + uuid.
+    Extract the experiment directory from a model path.
     
-    Format: experiments/YYYYMMDD_HHMMSS_<short_uuid>/
+    If model is at experiments/20260105_193822_xxx/model.zip,
+    returns experiments/20260105_193822_xxx/
     
+    Args:
+        model_path: Path to model file
+        
     Returns:
-        Path to the created directory
+        Path to experiment directory (parent of model file)
     """
+    # Get the directory containing the model
+    exp_dir = os.path.dirname(model_path)
+    
+    # If it's a valid experiment directory (in experiments/), use it
+    if "experiments" in exp_dir:
+        return exp_dir
+    
+    # Otherwise create a new one (fallback for old model paths)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     short_uuid = str(uuid.uuid4())[:8]
     exp_name = f"{timestamp}_{short_uuid}"
-    exp_dir = os.path.join(base_dir, exp_name)
-    os.makedirs(exp_dir, exist_ok=True)
-    return exp_dir
+    new_dir = os.path.join("experiments", exp_name)
+    os.makedirs(new_dir, exist_ok=True)
+    return new_dir
 
 
 # =============================================================================
@@ -350,9 +362,9 @@ def main(model_path=None, n_episodes=20, seed=42):
     # Generate visualizations
     print("\n4. Generating visualizations...")
     
-    # Create experiment directory with datetime + uuid
-    exp_dir = create_experiment_dir("experiments")
-    print(f"   Experiment directory: {exp_dir}")
+    # Use the same experiment directory as the model
+    exp_dir = get_experiment_dir_from_model(model_path)
+    print(f"   Saving to model's experiment directory: {exp_dir}")
     
     # Plot 1: Single episode trajectory
     fig1 = plot_episode_trajectory(trained_episodes[0], "Trained Agent - Episode 1")
@@ -374,16 +386,17 @@ def main(model_path=None, n_episodes=20, seed=42):
     fig4.savefig(os.path.join(exp_dir, "greeks_vs_actions.png"), dpi=150, bbox_inches='tight')
     print(f"   Saved: {exp_dir}/greeks_vs_actions.png")
     
-    # Save experiment metadata
-    metadata_path = os.path.join(exp_dir, "metadata.txt")
+    # Save visualization metadata (append to existing or create new)
+    metadata_path = os.path.join(exp_dir, "visualization_metadata.txt")
     with open(metadata_path, "w") as f:
+        f.write(f"Visualization run at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Model: {model_path}\n")
         f.write(f"Episodes: {n_episodes}\n")
         f.write(f"Seed: {seed}\n")
         f.write(f"Trained Avg Reward: {np.mean(trained_rewards):.4f}\n")
         f.write(f"Random Avg Reward: {np.mean(random_rewards):.4f}\n")
         f.write(f"Improvement: {np.mean(trained_rewards) - np.mean(random_rewards):.4f}\n")
-    print(f"   Saved: {exp_dir}/metadata.txt")
+    print(f"   Saved: {exp_dir}/visualization_metadata.txt")
     
     # Summary statistics
     print("\n" + "=" * 60)
