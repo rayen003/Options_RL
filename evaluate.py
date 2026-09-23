@@ -3,6 +3,7 @@
 Protocol and interpretation limits: docs/EVALUATION_PROTOCOL.md.
 """
 
+import argparse
 from collections import defaultdict
 import csv
 import json
@@ -237,3 +238,51 @@ def write_report(rows, output_dir, episode_length=60, model_paths=None):
         "warning": "Results come from simulated BSM quotes and paths, not real-market performance.",
     }
     targets[4].write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Compare policies on matched simulated options paths")
+    parser.add_argument("--episodes", type=int, default=20, help="Number of held-out paths (default: 20)")
+    parser.add_argument("--seed-start", type=int, default=10_000, help="First path seed (default: 10000)")
+    parser.add_argument("--episode-length", type=int, default=60, help="Trading days per path")
+    parser.add_argument("--output", type=Path, required=True, help="New directory for report files")
+    parser.add_argument(
+        "--model", action="append", default=[], metavar="SEED=PATH",
+        help="PPO training seed and model .zip; repeat for each independent run",
+    )
+    args = parser.parse_args(argv)
+    if args.episodes <= 0 or args.episode_length <= 0 or args.seed_start < 0:
+        parser.error("episodes and episode-length must be positive; seed-start must be nonnegative")
+
+    model_paths = {}
+    for spec in args.model:
+        seed_text, separator, path = spec.partition("=")
+        if not separator or not path:
+            parser.error(f"Invalid --model '{spec}'; expected SEED=PATH")
+        try:
+            training_seed = int(seed_text)
+        except ValueError:
+            parser.error(f"Invalid training seed in --model '{spec}'")
+        if training_seed in model_paths:
+            parser.error(f"Duplicate training seed {training_seed}")
+        model_paths[training_seed] = Path(path)
+
+    models = {}
+    if model_paths:
+        from stable_baselines3 import PPO
+
+        for training_seed, path in model_paths.items():
+            models[training_seed] = PPO.load(path)
+
+    seeds = range(args.seed_start, args.seed_start + args.episodes)
+    rows = run_study(seeds=seeds, models=models, episode_length=args.episode_length)
+    write_report(rows, args.output, episode_length=args.episode_length, model_paths=model_paths)
+    print("Simulated options-path evaluation; not real-market performance.")
+    for (policy, training_seed), stats in summarize_results(rows).items():
+        label = _policy_label(policy, training_seed)
+        print(f"{label}: median terminal return {stats['median']:+.2f}% across {stats['n']} paths")
+    print(f"Report: {args.output}")
+
+
+if __name__ == "__main__":
+    main()
