@@ -62,10 +62,10 @@ class OptionsEnv(gym.Env):
     └────────────────────────────────────────────────────────────────┘
     
     Action Space (5 discrete actions):
-        0: BUY_CALL  - Buy 1 call contract (or close short call)
-        1: BUY_PUT   - Buy 1 put contract (or close short put)
-        2: SELL_CALL - Sell 1 call contract (or close long call)
-        3: SELL_PUT  - Sell 1 put contract (or close long put)
+        0: BUY_CALL  - Set call position to +1 (reverse short if needed)
+        1: BUY_PUT   - Set put position to +1 (reverse short if needed)
+        2: SELL_CALL - Set call position to -1 (reverse long if needed)
+        3: SELL_PUT  - Set put position to -1 (reverse long if needed)
         4: HOLD      - Do nothing
     """
     
@@ -660,19 +660,19 @@ class OptionsEnv(gym.Env):
         
         Actions:
             0 (BUY_CALL):  If flat → go long 1 call
-                           If short call → close short call
+                           If short call → reverse to long
                            If long call → do nothing
             
             1 (BUY_PUT):   If flat → go long 1 put
-                           If short put → close short put
+                           If short put → reverse to long
                            If long put → do nothing
             
             2 (SELL_CALL): If flat → go short 1 call
-                           If long call → close long call
+                           If long call → reverse to short
                            If short call → do nothing
             
             3 (SELL_PUT):  If flat → go short 1 put
-                           If long put → close long put
+                           If long put → reverse to short
                            If short put → do nothing
             
             4 (HOLD):      Do nothing

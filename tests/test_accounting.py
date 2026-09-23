@@ -96,6 +96,23 @@ def test_short_put_terminal_close_pays_ask():
     assert env.put_position == 0
 
 
+def test_expiry_settles_call_at_intrinsic_value_without_spread():
+    env = make_env(episode_length=4, risk_free_rate=0)
+    env.initial_tte = 1 / 252
+    env.reset(seed=7)
+    opening_ask = env.call_price * (1 + env.transaction_cost / 2)
+
+    _, _, terminated, truncated, info = env.step(env.ACTION_BUY_CALL)
+    intrinsic = max(env.spot - env.strike, 0)
+
+    assert terminated
+    assert not truncated
+    assert env.call_position == 0
+    assert info["portfolio_value"] == pytest.approx(
+        env.initial_cash - 100 * opening_ask + 100 * intrinsic
+    )
+
+
 def test_each_unshaped_reward_reconciles_with_account_value():
     env = make_env(episode_length=4)
     previous_value = env._calculate_portfolio_value()
