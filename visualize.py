@@ -103,7 +103,7 @@ def run_episode(env, model, seed=None, deterministic=True):
         # Calculate portfolio value (cash + positions)
         call_value = info["call_position"] * info["call_price"] * 100
         put_value = info["put_position"] * info["put_price"] * 100
-        portfolio_value = info["cash"] + call_value + put_value
+        portfolio_value = info["portfolio_value"]
         
         data["observations"].append(obs.copy())
         data["actions"].append(int(action))
@@ -142,7 +142,7 @@ def run_random_episode(env, seed=None):
         # Calculate portfolio value
         call_value = info["call_position"] * info["call_price"] * 100
         put_value = info["put_position"] * info["put_price"] * 100
-        portfolio_value = info["cash"] + call_value + put_value
+        portfolio_value = info["portfolio_value"]
         
         data["rewards"].append(reward)
         data["portfolio_values"].append(portfolio_value)
@@ -154,6 +154,46 @@ def run_random_episode(env, seed=None):
 # =============================================================================
 # Visualization Functions
 # =============================================================================
+
+def episode_diagnostics(portfolio_values):
+    """Return dollar P&L per step and percent drawdown from prior peak."""
+    values = np.asarray(portfolio_values, dtype=float)
+    if values.ndim != 1 or len(values) < 2 or not np.isfinite(values).all() or values[0] <= 0:
+        raise ValueError("portfolio_values must be a finite series with positive initial value")
+    daily_pnl = np.diff(values)
+    drawdown = (values / np.maximum.accumulate(values) - 1) * 100
+    return daily_pnl, drawdown
+
+
+def plot_episode_summary(data):
+    """Show account value, daily profit/loss, and peak-to-trough loss."""
+    values = np.asarray(data["portfolio_values"], dtype=float)
+    daily_pnl, drawdown = episode_diagnostics(values)
+    days = np.arange(len(values))
+    final_return = (values[-1] / values[0] - 1) * 100
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    fig.suptitle(
+        f"Simulated episode | return {final_return:+.1f}% | max drawdown {drawdown.min():.1f}%"
+    )
+    axes[0].plot(days, values, color="#24577a", linewidth=2)
+    axes[0].axhline(values[0], color="gray", linestyle="--", linewidth=1)
+    axes[0].set_ylabel("Portfolio value ($)")
+
+    bar_colors = np.where(daily_pnl >= 0, "#26734d", "#ad3940")
+    axes[1].bar(days[1:], daily_pnl, color=bar_colors)
+    axes[1].axhline(0, color="gray", linewidth=1)
+    axes[1].set_ylabel("Daily P&L ($)")
+
+    axes[2].fill_between(days, drawdown, 0, color="#ad3940", alpha=0.3)
+    axes[2].plot(days, drawdown, color="#ad3940", linewidth=1.5)
+    axes[2].set_ylabel("Drawdown (%)")
+    axes[2].set_xlabel("Trading day")
+    for ax in axes:
+        ax.grid(True, alpha=0.2)
+    fig.text(0.5, 0.01, "Simulated path; not evidence of real-world performance.", ha="center")
+    fig.tight_layout(rect=(0, 0.03, 1, 0.96))
+    return fig
 
 def plot_episode_trajectory(data, title="Episode Trajectory"):
     """
@@ -343,10 +383,10 @@ def plot_greeks_vs_actions(episodes_data):
     
     fig, ax = plt.subplots(figsize=(10, 8))
     
-    action_labels = {0: 'BUY', 1: 'HOLD', 2: 'SELL'}
-    action_colors = {0: 'green', 1: 'gray', 2: 'red'}
+    action_labels = {0: 'BUY CALL', 1: 'BUY PUT', 2: 'SELL CALL', 3: 'SELL PUT', 4: 'HOLD'}
+    action_colors = {0: 'green', 1: 'lime', 2: 'red', 3: 'orange', 4: 'gray'}
     
-    for action in [0, 1, 2]:
+    for action in range(5):
         mask = [a == action for a in actions]
         ax.scatter(
             [d for d, m in zip(deltas, mask) if m],
@@ -428,7 +468,13 @@ def main(model_path=None, n_episodes=20, seed=42):
     exp_dir = get_experiment_dir_from_model(model_path)
     print(f"   Saving to model's experiment directory: {exp_dir}")
     
-    # Plot 1: Single episode trajectory
+    # Plot 1: Reader-facing account diagnostics
+    fig0 = plot_episode_summary(trained_episodes[0])
+    fig0.savefig(os.path.join(exp_dir, "episode_summary.png"), dpi=150, bbox_inches='tight')
+    plt.close(fig0)
+    print(f"   Saved: {exp_dir}/episode_summary.png")
+
+    # Plot 2: Single episode trajectory
     fig1 = plot_episode_trajectory(trained_episodes[0], "Trained Agent - Episode 1")
     fig1.savefig(os.path.join(exp_dir, "episode_trajectory.png"), dpi=150, bbox_inches='tight')
     print(f"   Saved: {exp_dir}/episode_trajectory.png")
