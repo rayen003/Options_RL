@@ -120,6 +120,13 @@ def train(
         episode_rewards: List of rewards per episode
         exp_dir: Path to experiment directory
     """
+    # Reserve output before expensive training; fail fast on permissions/collisions.
+    if output_dir is None:
+        exp_dir = create_experiment_dir("experiments")
+    else:
+        exp_dir = os.fspath(output_dir)
+        os.makedirs(exp_dir, exist_ok=False)
+
     print("=" * 60)
     print("OPTIONS RL TRAINING")
     print("=" * 60)
@@ -188,11 +195,6 @@ def train(
     print("\n4. Saving Model...")
     
     # Create experiment directory
-    if output_dir is None:
-        exp_dir = create_experiment_dir("experiments")
-    else:
-        exp_dir = os.fspath(output_dir)
-        os.makedirs(exp_dir, exist_ok=False)
     model_path = os.path.join(exp_dir, "model")
     model.save(model_path)
     
@@ -203,6 +205,7 @@ def train(
     metadata_path = os.path.join(exp_dir, "training_metadata.txt")
     with open(metadata_path, "w") as f:
         f.write(f"Total Timesteps: {total_timesteps}\n")
+        f.write(f"Actual Timesteps: {model.num_timesteps}\n")
         f.write(f"Learning Rate: {learning_rate}\n")
         f.write(f"Gamma: {gamma}\n")
         f.write(f"Seed: {seed}\n")
