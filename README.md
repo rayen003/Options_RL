@@ -6,7 +6,8 @@ This is an educational reinforcement-learning project, not a live trading system
 
 - `bsm.py`: European call/put pricing, autograd Greeks, Newton–Raphson implied-volatility inversion.
 - `env.py`: one simulated underlying, one call and one put, each with position −1, 0, or +1 contract. Underlying follows regime-dependent GBM; volatility follows a mean-reverting process by default.
-- `train.py`: Stable-Baselines3 PPO training and a small exploratory evaluation.
+- `train.py`: Stable-Baselines3 PPO training; writes model and run metadata.
+- `evaluate.py`: paired comparison of hold-cash, random, simple regime rule, and saved PPO models on the same held-out simulated paths.
 - `visualize.py`: episode charts, action counts, and exploratory reward comparison. `episode_summary.png` shows account value, daily profit/loss, and drawdown.
 - `tests/`: regression checks for trade cash flows, liquidation, rewards, and chart calculations.
 
@@ -19,9 +20,10 @@ python bsm.py                     # pricing demonstration
 python env.py                     # environment demonstration
 python train.py                   # default: 20,000 training steps
 python visualize.py --episodes 20 # requires a saved model from train.py
+python evaluate.py --help         # paired policy study options
 ```
 
-Training outputs and plots go under `experiments/`; this directory is ignored by Git. No trained model or verified performance result is shipped with this repository.
+Training outputs and plots go under `experiments/`; this directory is ignored by Git. No trained model is shipped with this repository. The [pre-registered evaluation protocol](docs/EVALUATION_PROTOCOL.md) and [synthetic study results](docs/EVALUATION_RESULTS.md) document one reproducible comparison.
 
 ## Environment in plain language
 
@@ -35,10 +37,10 @@ Base reward is change in marked portfolio value divided by initial cash. With re
 
 ## What results can and cannot show
 
-`episode_summary.png` explains one **simulated** path: whether account value rose, which days made/lost money, and how far value fell from a prior peak. It does not establish out-of-sample performance. Current quick comparison in `train.py` uses only five evaluation episodes per agent and different seeds. Treat it as a debugging aid, not evidence of outperformance. Any model trained before accounting fix must be retrained before interpretation.
+`episode_summary.png` explains one **simulated** path: whether account value rose, which days made/lost money, and how far value fell from a prior peak. It does not establish out-of-sample performance. The paired 20-path study is stronger than a single trajectory, but still only measures this simulator. One PPO seed matched the simple observed-regime rule on all reported episode metrics; the other seeds did not show a consistent advantage over that rule. See [results and limitations](docs/EVALUATION_RESULTS.md). Any model trained before the accounting fix must be retrained before interpretation.
 
 Important limits: simulated BSM prices use same volatility recovered by IV solver, so project does **not** demonstrate volatility mispricing or arbitrage. No order-book liquidity, margin requirement, collateral, dividends, stock hedging, or historical-data validation is modeled. Cash balance accrues risk-free rate, including negative balances and short-sale proceeds; that simplified financing assumption is not a realistic brokerage model. Naked short options are permitted in simulator and can produce losses beyond initial cash. This is not investment advice.
 
 ## Next research step
 
-After ledger checks: retrain from scratch; evaluate PPO against hold-cash, random, and simple rule-based policies on **same held-out simulated paths**. Report distributions of terminal return, drawdown, transaction costs, and sensitivity to regime/volatility assumptions—not a single “improvement” percentage.
+Test stronger risk-aware baselines and more realistic market assumptions on **new** held-out paths. Do not tune on the 20 seeds already used for the documented study. Pricing, Greeks, and BSM review is a separate learning step.
