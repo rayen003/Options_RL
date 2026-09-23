@@ -157,7 +157,7 @@ class OptionsEnv(gym.Env):
         self.iv_penalty_weight = iv_penalty_weight
         self.iv_bonus_weight = iv_bonus_weight
         
-        # REAL-LIFE SETUP:
+        # SIMULATOR SETUP:
         # - true_volatility: Hidden vol that market maker uses (agent doesn't see)
         # - market_price: Price computed from true_volatility
         # - implied_volatility: Agent extracts this using Newton-Raphson
@@ -258,8 +258,7 @@ class OptionsEnv(gym.Env):
         self.call_entry_price = 0.0 # Price we bought/sold call at
         self.put_entry_price = 0.0  # Price we bought/sold put at
         
-        # NEW: Bond investment (uninvested cash earns risk-free rate)
-        # This represents cash sitting in a money market account
+        # Simplified financing: all cash balances accrue at the risk-free rate.
         self.total_interest_earned = 0.0  # Cumulative interest from bonds
         
         self.step_count = 0
@@ -313,7 +312,7 @@ class OptionsEnv(gym.Env):
             )
             
             # =====================================================================
-            # STEP 2: Agent extracts IV using Newton-Raphson (REAL-LIFE PROCESS)
+            # STEP 2: Invert the simulated quote with Newton-Raphson.
             # =====================================================================
             # Extract IV from call price (could also use put price)
             self._extract_implied_volatility()
@@ -415,7 +414,7 @@ class OptionsEnv(gym.Env):
         
         NEW: With both calls and puts, we track separate prices, positions, and Greeks.
         
-        REAL-LIFE SETUP:
+        SIMULATOR SETUP:
         - true_vol: Hidden volatility (market maker's secret)
         - implied_vol: What agent extracted using Newton-Raphson
         - iv_error: Difference between true and extracted (numerical error)
@@ -445,7 +444,7 @@ class OptionsEnv(gym.Env):
             "tte": self.tte,
             "regime": self.regime,
             "regime_name": "BULL" if self.regime == 1 else "BEAR",
-            # REAL-LIFE IV SETUP
+            # Simulated quote and extracted IV.
             "true_vol": self.true_volatility,         # Hidden from agent (market maker's)
             "implied_vol": self.implied_volatility,   # Agent's extracted IV
             "iv_error": iv_error,                     # How accurate was Newton-Raphson?
@@ -493,7 +492,7 @@ class OptionsEnv(gym.Env):
         else:
             self.regime = 1  # Default to bull if regimes disabled
         
-        # Reset volatility (REAL-LIFE SETUP)
+        # Reset simulated volatility.
         if self.use_stochastic_vol:
             # TRUE volatility: Market maker's hidden vol (with random start)
             self.true_volatility = self.initial_volatility * (1 + 0.1 * self.np_random.standard_normal())
@@ -520,7 +519,7 @@ class OptionsEnv(gym.Env):
         """
         Simulate the TRUE volatility using Ornstein-Uhlenbeck process.
         
-        REAL-LIFE SETUP:
+        SIMULATOR SETUP:
         ================
         The "market maker" has access to this true volatility.
         The AGENT does NOT see this - they only see market prices.
@@ -773,7 +772,7 @@ class OptionsEnv(gym.Env):
         
         Returns:
             observation: New state vector (16 features with default settings)
-            reward: Profit/loss this step minus transaction costs
+            reward: Normalized portfolio-value change plus shaping terms
             terminated: True if episode ended naturally (e.g., expiration)
             truncated: True if episode ended early (e.g., time limit)
             info: Debug information
@@ -788,9 +787,7 @@ class OptionsEnv(gym.Env):
         self._simulate_price_movement()
         self.step_count += 1
         
-        # 3.5 NEW: Accrue interest on uninvested cash (money market account)
-        # Cash earns risk-free rate per day: r_daily = r_annual / 252
-        # This is realistic - brokers automatically sweep idle cash into money market funds
+        # Simplified financing, including negative cash and short-sale proceeds.
         daily_interest = self.cash * (self.rate / 252)
         self.cash += daily_interest
         self.total_interest_earned += daily_interest
@@ -858,7 +855,7 @@ class OptionsEnv(gym.Env):
             reward_components["delta_penalty"] = delta_penalty
             
             # 2. IV PENALTY/BONUS: Buy cheap options, sell expensive ones
-            # This encourages volatility arbitrage behavior
+            # This is a heuristic incentive, not evidence of volatility mispricing.
             current_iv = self.implied_volatility
             
             # Penalize buying when IV is high (options are expensive)
@@ -902,17 +899,11 @@ if __name__ == "__main__":
     print("SIMULATED QUOTE WORKFLOW")
     print("-" * 80)
     print("""
-    1. Market Maker has TRUE volatility (hidden from agent)
-       - Evolves via Ornstein-Uhlenbeck process
-    
-    2. Market Maker prices option using TRUE volatility
-       - Agent sees this price on their screen
-    
-    3. Agent uses NEWTON-RAPHSON to extract IMPLIED volatility
-       - Finds σ such that: BSM(spot, strike, T, r, σ) = Market_Price
-    
-    4. Agent makes decisions using EXTRACTED IV (not true vol!)
-       - Greeks computed from extracted IV
+    1. Simulated volatility evolves via a mean-reverting process.
+    2. BSM generates call and put quotes from that volatility.
+    3. Newton-Raphson inverts the call quote to recover implied volatility.
+    4. Agent observes extracted IV and Greeks, not simulator volatility.
+    This inversion creates no option-pricing edge by itself.
     """)
     
     print("-" * 80)

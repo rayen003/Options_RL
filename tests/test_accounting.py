@@ -94,3 +94,21 @@ def test_short_put_terminal_close_pays_ask():
 
     assert env.cash == pytest.approx(env.initial_cash + 100 * (opening_bid - final_ask))
     assert env.put_position == 0
+
+
+def test_each_unshaped_reward_reconciles_with_account_value():
+    env = make_env(episode_length=4)
+    previous_value = env._calculate_portfolio_value()
+
+    for action in (
+        env.ACTION_BUY_CALL,
+        env.ACTION_HOLD,
+        env.ACTION_SELL_CALL,
+        env.ACTION_BUY_PUT,
+    ):
+        _, reward, _, _, info = env.step(action)
+        current_value = info["portfolio_value"]
+        assert reward == pytest.approx(
+            (current_value - previous_value) / env.initial_cash
+        )
+        previous_value = current_value

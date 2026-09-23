@@ -100,9 +100,7 @@ def run_episode(env, model, seed=None, deterministic=True):
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
-        # Calculate portfolio value (cash + positions)
-        call_value = info["call_position"] * info["call_price"] * 100
-        put_value = info["put_position"] * info["put_price"] * 100
+        # Use environment ledger, including terminal liquidation.
         portfolio_value = info["portfolio_value"]
         
         data["observations"].append(obs.copy())
@@ -139,9 +137,6 @@ def run_random_episode(env, seed=None):
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         
-        # Calculate portfolio value
-        call_value = info["call_position"] * info["call_price"] * 100
-        put_value = info["put_position"] * info["put_price"] * 100
         portfolio_value = info["portfolio_value"]
         
         data["rewards"].append(reward)
