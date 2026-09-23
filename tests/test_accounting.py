@@ -88,8 +88,8 @@ def test_final_reward_uses_value_after_liquidation():
 
 def test_short_put_terminal_close_pays_ask():
     env = make_env(episode_length=1, risk_free_rate=0)
+    opening_bid = env.put_price * (1 - env.transaction_cost / 2)
     env.step(env.ACTION_SELL_PUT)
-    opening_bid = env.put_entry_price
     final_ask = env.put_price * (1 + env.transaction_cost / 2)
 
     assert env.cash == pytest.approx(env.initial_cash + 100 * (opening_bid - final_ask))

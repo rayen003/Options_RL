@@ -692,73 +692,58 @@ class OptionsEnv(gym.Env):
             - SELL_CALL + BUY_PUT = Protective Put (downside protection)
             - BUY_CALL + SELL_PUT = Synthetic Long (replicates long stock)
         """
-        transaction_cost = 0.0
-        
-        # ====================== CALL ACTIONS ======================
-        if action == self.ACTION_BUY_CALL:
-            if self.call_position <= 0:  # Flat or short → buy
-                # Close any short call position first
-                if self.call_position == -1:
-                    # Buying back short call: pay the ask price
-                    buy_price = self.call_price * (1 + self.transaction_cost / 2)
-                    pnl = (self.call_entry_price - buy_price) * 100  # Short profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.call_price * self.transaction_cost / 2 * 100
-                
-                # Go long call
-                self.call_position = 1
-                self.call_entry_price = self.call_price * (1 + self.transaction_cost / 2)
-                transaction_cost += self.call_price * self.transaction_cost / 2 * 100
-                
-        elif action == self.ACTION_SELL_CALL:
-            if self.call_position >= 0:  # Flat or long → sell
-                # Close any long call position first
-                if self.call_position == 1:
-                    # Selling long call: receive the bid price
-                    sell_price = self.call_price * (1 - self.transaction_cost / 2)
-                    pnl = (sell_price - self.call_entry_price) * 100  # Long profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.call_price * self.transaction_cost / 2 * 100
-                
-                # Go short call
-                self.call_position = -1
-                self.call_entry_price = self.call_price * (1 - self.transaction_cost / 2)
-                transaction_cost += self.call_price * self.transaction_cost / 2 * 100
-        
-        # ====================== PUT ACTIONS ======================
-        elif action == self.ACTION_BUY_PUT:
-            if self.put_position <= 0:  # Flat or short → buy
-                # Close any short put position first
-                if self.put_position == -1:
-                    # Buying back short put: pay the ask price
-                    buy_price = self.put_price * (1 + self.transaction_cost / 2)
-                    pnl = (self.put_entry_price - buy_price) * 100  # Short profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.put_price * self.transaction_cost / 2 * 100
-                
-                # Go long put
-                self.put_position = 1
-                self.put_entry_price = self.put_price * (1 + self.transaction_cost / 2)
-                transaction_cost += self.put_price * self.transaction_cost / 2 * 100
-                
-        elif action == self.ACTION_SELL_PUT:
-            if self.put_position >= 0:  # Flat or long → sell
-                # Close any long put position first
-                if self.put_position == 1:
-                    # Selling long put: receive the bid price
-                    sell_price = self.put_price * (1 - self.transaction_cost / 2)
-                    pnl = (sell_price - self.put_entry_price) * 100  # Long profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.put_price * self.transaction_cost / 2 * 100
-                
-                # Go short put
-                self.put_position = -1
-                self.put_entry_price = self.put_price * (1 - self.transaction_cost / 2)
-                transaction_cost += self.put_price * self.transaction_cost / 2 * 100
-        
-        # ACTION_HOLD: do nothing, transaction_cost stays 0
-        
-        return transaction_cost
+        if action == self.ACTION_HOLD:
+            return 0.0
+
+        trades = {
+            self.ACTION_BUY_CALL: ("call", 1),
+            self.ACTION_BUY_PUT: ("put", 1),
+            self.ACTION_SELL_CALL: ("call", -1),
+            self.ACTION_SELL_PUT: ("put", -1),
+        }
+        if action not in trades:
+            raise ValueError(f"Invalid action: {action}")
+
+        option_type, target_position = trades[action]
+        position_name = f"{option_type}_position"
+        current_position = getattr(self, position_name)
+        quantity = target_position - current_position
+        if quantity == 0:
+            return 0.0
+
+        mid = getattr(self, f"{option_type}_price")
+        half_spread = mid * self.transaction_cost / 2
+        fill_price = mid + half_spread if quantity > 0 else mid - half_spread
+        self.cash -= quantity * fill_price * 100
+        setattr(self, position_name, target_position)
+        setattr(self, f"{option_type}_entry_price", fill_price)
+        return abs(quantity) * half_spread * 100
+
+    def _close_positions(self, at_expiry: bool) -> float:
+        """Settle positions into cash; return spread cost on market closes."""
+        spread_cost = 0.0
+        for option_type in ("call", "put"):
+            position_name = f"{option_type}_position"
+            position = getattr(self, position_name)
+            if position == 0:
+                continue
+
+            mid = getattr(self, f"{option_type}_price")
+            if at_expiry:
+                intrinsic = max(
+                    self.spot - self.strike if option_type == "call" else self.strike - self.spot,
+                    0.0,
+                )
+                fill_price = intrinsic
+            else:
+                half_spread = mid * self.transaction_cost / 2
+                fill_price = mid - half_spread if position > 0 else mid + half_spread
+                spread_cost += half_spread * 100
+
+            self.cash += position * fill_price * 100
+            setattr(self, position_name, 0)
+            setattr(self, f"{option_type}_entry_price", 0.0)
+        return spread_cost
     
     def _calculate_portfolio_value(self) -> float:
         """
@@ -818,17 +803,23 @@ class OptionsEnv(gym.Env):
         self.cash += daily_interest
         self.total_interest_earned += daily_interest
         
-        # 4. Get new observation (also updates self.option_price)
+        # 4. Reprice options after the market move.
         obs = self._get_observation()
-        
-        # 5. Portfolio value after
+        exposure_call = self.call_position
+        exposure_put = self.put_position
+
+        # 5. Liquidate before final reward and reported portfolio value.
+        terminated = self.tte <= 0.001
+        truncated = self.step_count >= self.episode_length and not terminated
+        if terminated or truncated:
+            transaction_cost += self._close_positions(at_expiry=terminated)
+            obs = self._get_observation()
+
         value_after = self._calculate_portfolio_value()
-        
-        # 6. Calculate reward
-        # Reward = Change in portfolio value - Transaction costs
-        # We normalize by initial cash to keep rewards in a reasonable range
+
+        # 6. Cash flows already include bid/ask spread: never subtract it twice.
         raw_pnl = value_after - value_before
-        reward = (raw_pnl - transaction_cost) / self.initial_cash
+        reward = raw_pnl / self.initial_cash
         
          # Track reward components for debugging
         reward_components = {
@@ -843,19 +834,19 @@ class OptionsEnv(gym.Env):
         # NEW: Check both call and put positions
         if self.use_regime:
             # Long calls in bear market = bad (losing money fighting the trend)
-            if self.call_position == 1 and self.regime == -1:
+            if exposure_call == 1 and self.regime == -1:
                 reward -= 0.005
                 reward_components["regime_penalty"] = -0.005
             # Short calls in bull market = bad (missing the upside)
-            elif self.call_position == -1 and self.regime == 1:
+            elif exposure_call == -1 and self.regime == 1:
                 reward -= 0.005
                 reward_components["regime_penalty"] = -0.005
             # Long puts in bull market = bad (puts lose value in bull markets)
-            if self.put_position == 1 and self.regime == 1:
+            if exposure_put == 1 and self.regime == 1:
                 reward -= 0.005
                 reward_components["regime_penalty"] -= 0.005
             # Short puts in bear market = bad (puts gain value in bear markets)
-            elif self.put_position == -1 and self.regime == -1:
+            elif exposure_put == -1 and self.regime == -1:
                 reward -= 0.005
                 reward_components["regime_penalty"] -= 0.005
         
@@ -869,7 +860,7 @@ class OptionsEnv(gym.Env):
             # Example: Long call (delta=0.5) + Short put (delta=-0.5, position=-1) = Synthetic long (delta~1)
             call_delta = self.call_greeks.get("delta", 0.5)
             put_delta = self.put_greeks.get("delta", -0.5)
-            portfolio_delta = self.call_position * call_delta + self.put_position * put_delta
+            portfolio_delta = exposure_call * call_delta + exposure_put * put_delta
             delta_penalty = -self.delta_penalty_weight * abs(portfolio_delta)
             reward += delta_penalty
             reward_components["delta_penalty"] = delta_penalty
@@ -890,56 +881,7 @@ class OptionsEnv(gym.Env):
                 reward += iv_bonus
                 reward_components["iv_penalty"] = iv_bonus  # Stored as positive
         
-        # 7. Check termination conditions
-        terminated = False
-        truncated = False
-        
-        # Episode ends if:
-        # a) We've reached the episode length
-        if self.step_count >= self.episode_length:
-            truncated = True
-            # Force close any open positions at episode end
-            # NEW: Close both call and put positions
-            if self.call_position != 0:
-                close_cost = self.call_price * self.transaction_cost / 2 * 100
-                if self.call_position == 1:
-                    self.cash += (self.call_price - self.call_entry_price) * 100 - close_cost
-                else:
-                    self.cash += (self.call_entry_price - self.call_price) * 100 - close_cost
-                self.call_position = 0
-            
-            if self.put_position != 0:
-                close_cost = self.put_price * self.transaction_cost / 2 * 100
-                if self.put_position == 1:
-                    self.cash += (self.put_price - self.put_entry_price) * 100 - close_cost
-                else:
-                    self.cash += (self.put_entry_price - self.put_price) * 100 - close_cost
-                self.put_position = 0
-        
-        # b) Options expired (time to expiry reached 0)
-        if self.tte <= 0.001:
-            terminated = True
-            # At expiration: 
-            # Call is worth max(S - K, 0)
-            # Put is worth max(K - S, 0)
-            call_intrinsic = max(0, self.spot - self.strike)
-            put_intrinsic = max(0, self.strike - self.spot)
-            
-            # Settle call position
-            if self.call_position == 1:
-                self.cash += (call_intrinsic - self.call_entry_price) * 100
-            elif self.call_position == -1:
-                self.cash += (self.call_entry_price - call_intrinsic) * 100
-            self.call_position = 0
-            
-            # Settle put position
-            if self.put_position == 1:
-                self.cash += (put_intrinsic - self.put_entry_price) * 100
-            elif self.put_position == -1:
-                self.cash += (self.put_entry_price - put_intrinsic) * 100
-            self.put_position = 0
-        
-        # 8. Get info
+        # 7. Get info
         info = self._get_info()
         info["transaction_cost"] = transaction_cost
         info["reward"] = reward
