@@ -2,6 +2,9 @@
 
 import csv
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import matplotlib
 import numpy as np
@@ -145,3 +148,22 @@ def test_report_preserves_raw_rows_protocol_and_simulation_warning(tmp_path):
     assert (tmp_path / "summary.csv").exists()
     assert (tmp_path / "paired_differences.csv").exists()
     assert (tmp_path / "comparison.png").exists()
+
+
+def test_command_line_runs_baseline_pilot_and_saves_report(tmp_path):
+    output = tmp_path / "pilot"
+    result = subprocess.run(
+        [
+            sys.executable, "-B", "evaluate.py", "--episodes", "1",
+            "--episode-length", "2", "--output", str(output),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (output / "episodes.csv").exists()
+    assert "simulated" in result.stdout.lower()
