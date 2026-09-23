@@ -12,15 +12,11 @@ State Space:
 MDP Structure:
     - State: [spot, tte, call_greeks, put_greeks, call_pos, put_pos, pnls, regime, iv]
     - Action: {0: BUY_CALL, 1: BUY_PUT, 2: SELL_CALL, 3: SELL_PUT, 4: HOLD}
-    - Reward: Change in portfolio value - transaction costs
+    - Base reward: Change in portfolio value (bid/ask costs already in cash flows)
     - Episode: 60 trading days (default)
     
-Educational Note:
-    With both calls and puts, agent can learn:
-    - Hedging (protective puts, covered calls)
-    - Spreads (bull call, bear put, iron condor)
-    - Synthetic positions (synthetic long = long call + short put)
-    - Put-call parity
+    Scope: one call and one put at a single strike; no underlying position,
+    margin, or multi-strike spreads are modeled.
 """
 
 import gymnasium as gym
@@ -40,11 +36,8 @@ class OptionsEnv(gym.Env):
     The agent trades both ATM call and put options over a 60-day episode.
     Stock price evolves via Geometric Brownian Motion (GBM).
     
-    NEW: With both calls AND puts, agent can learn sophisticated strategies:
-        - Hedging: Protective puts, covered calls
-        - Spreads: Bull call, bear put, iron condor, straddles
-        - Synthetics: Synthetic long (call + short put), conversion/reversal
-        - Put-Call Parity: C - P = S - K*e^(-rT)
+    Calls and puts can be combined, but strategies requiring an underlying
+    position or multiple strikes are outside this environment.
     
     Observation Space (~18 features, dynamically sized):
     ┌────────────────────────────────────────────────────────────────┐
@@ -285,7 +278,7 @@ class OptionsEnv(gym.Env):
         """
         Construct the observation vector from current state.
         
-        REAL-LIFE WORKFLOW:
+        SIMULATED QUOTE WORKFLOW:
         ===================
         1. Market maker prices BOTH call and put using true_volatility (hidden)
         2. Agent sees market_prices on screen
@@ -293,7 +286,8 @@ class OptionsEnv(gym.Env):
         4. Agent computes Greeks for BOTH call and put using extracted IV
         5. Agent makes decisions based on extracted IV, NOT true vol
         
-        This is realistic - in real life you never know the "true" volatility!
+        Both quote and extracted IV use the same BSM model. This creates no
+        volatility-pricing edge; inversion mainly exposes a numerical method.
         """
         # =====================================================================
         # STEP 1: Market maker prices BOTH options using TRUE volatility
@@ -687,10 +681,8 @@ class OptionsEnv(gym.Env):
         Returns:
             Transaction cost incurred (0 if no trade)
             
-        Educational Note:
-            - BUY_CALL + BUY_PUT = Long Straddle (profit from big moves either way)
-            - SELL_CALL + BUY_PUT = Protective Put (downside protection)
-            - BUY_CALL + SELL_PUT = Synthetic Long (replicates long stock)
+        Buying or selling sets target position to +1 or -1. A reversal closes
+        one contract and opens another, so it trades two contracts.
         """
         if action == self.ACTION_HOLD:
             return 0.0
@@ -772,15 +764,15 @@ class OptionsEnv(gym.Env):
             2. Execute the action (buy/hold/sell)
             3. Simulate stock price movement (GBM)
             4. Record portfolio value AFTER
-            5. Calculate reward = change in value - transaction costs
+            5. Calculate base reward from change in marked portfolio value
             6. Check if episode is done
             7. Return new observation
         
         Args:
-            action: 0 (BUY), 1 (HOLD), or 2 (SELL)
+            action: 0 buy call, 1 buy put, 2 sell call, 3 sell put, 4 hold
         
         Returns:
-            observation: New state vector (8 features)
+            observation: New state vector (16 features with default settings)
             reward: Profit/loss this step minus transaction costs
             terminated: True if episode ended naturally (e.g., expiration)
             truncated: True if episode ended early (e.g., time limit)
@@ -897,7 +889,7 @@ class OptionsEnv(gym.Env):
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("OptionsEnv: REAL-LIFE WORKFLOW (Newton-Raphson IV Extraction)")
+    print("OptionsEnv: simulated quotes and implied-volatility extraction")
     print("=" * 80)
     
     # Create environment with regimes and stochastic vol enabled
@@ -907,7 +899,7 @@ if __name__ == "__main__":
     obs, info = env.reset(seed=42)
     
     print("\n" + "-" * 80)
-    print("REAL-LIFE WORKFLOW")
+    print("SIMULATED QUOTE WORKFLOW")
     print("-" * 80)
     print("""
     1. Market Maker has TRUE volatility (hidden from agent)
@@ -932,7 +924,7 @@ if __name__ == "__main__":
     print(f"  Bull Drift: {env.bull_drift:.0%}")
     print(f"  Bear Drift: {env.bear_drift:.0%}")
     print(f"  Switch Probability: {env.regime_switch_prob:.0%} per day")
-    print(f"\nStochastic Volatility: ENABLED (Real-Life Mode)")
+    print(f"\nStochastic Volatility: ENABLED (simulated)")
     print(f"  Initial IV: {env.initial_volatility:.0%}")
     print(f"  Vol of Vol: {env.vol_of_vol:.0%}")
     print(f"  Mean Reversion Speed: {env.vol_mean_reversion}")
@@ -940,8 +932,10 @@ if __name__ == "__main__":
     
     # Feature names for display
     feature_names = [
-        "spot_norm", "tte", "delta", "gamma",
-        "vega", "theta", "position", "pnl", "regime", "implied_iv"
+        "spot_norm", "tte", "call_delta", "call_gamma", "call_vega",
+        "call_theta", "put_delta", "put_gamma", "put_vega", "put_theta",
+        "call_position", "put_position", "call_pnl", "put_pnl",
+        "regime", "implied_iv",
     ]
     
     print("\n" + "-" * 80)
@@ -949,9 +943,9 @@ if __name__ == "__main__":
     print("-" * 80)
     
     total_reward = 0
-    action_names = {0: "BUY ", 1: "HOLD", 2: "SELL"}
+    action_names = {0: "BUY CALL", 1: "BUY PUT", 2: "SELL CALL", 3: "SELL PUT", 4: "HOLD"}
     
-    print(f"\n{'Step':>4} | {'Regime':>5} | {'TrueVol':>7} | {'ExtractIV':>9} | {'Error':>6} | {'Action':>4} | {'Spot':>7} | {'Reward':>8}")
+    print(f"\n{'Step':>4} | {'Regime':>5} | {'TrueVol':>7} | {'ExtractIV':>9} | {'Error':>6} | {'Action':>9} | {'Spot':>7} | {'Reward':>8}")
     print("-" * 90)
     
     # Run a short episode
@@ -967,7 +961,7 @@ if __name__ == "__main__":
         true_vol = info['true_vol_pct']
         impl_vol = info['implied_vol_pct']
         iv_err = f"{info['iv_error']*100:.2f}%"
-        print(f"{step:>4} | {regime_str:>5} | {true_vol:>7} | {impl_vol:>9} | {iv_err:>6} | {action_names[action]:>4} | ${info['spot']:>6.2f} | {reward:>+8.4f}")
+        print(f"{step:>4} | {regime_str:>5} | {true_vol:>7} | {impl_vol:>9} | {iv_err:>6} | {action_names[action]:>9} | ${info['spot']:>6.2f} | {reward:>+8.4f}")
         
         if terminated or truncated:
             print("\n[Episode ended]")
@@ -977,7 +971,7 @@ if __name__ == "__main__":
     print("FINAL STATE")
     print("-" * 80)
     print(f"  Cash:            ${info['cash']:.2f}")
-    print(f"  Position:        {info['position']}")
+    print(f"  Call / Put positions: {info['call_position']} / {info['put_position']}")
     print(f"  Portfolio Value: ${info['portfolio_value']:.2f}")
     print(f"  Total Reward:    {total_reward:.4f}")
     print(f"  Final Regime:    {info['regime_name']}")
@@ -1002,15 +996,15 @@ if __name__ == "__main__":
     initial_value = info['cash']
     
     # Buy on day 0
-    obs, reward, _, _, info = env.step(0)  # BUY
-    print(f"Day 0: BUY  @ ${info['option_price']:.2f}")
+    obs, reward, _, _, info = env.step(env.ACTION_BUY_CALL)
+    print(f"Day 0: BUY CALL @ ${info['call_price']:.2f}")
     
     # Hold for 29 days
     for day in range(1, 30):
-        obs, reward, terminated, truncated, info = env.step(1)  # HOLD
+        obs, reward, terminated, truncated, info = env.step(env.ACTION_HOLD)
     
     final_value = info['portfolio_value']
-    print(f"Day 30: Spot=${info['spot']:.2f}, Option=${info['option_price']:.2f}")
+    print(f"Day 30: Spot=${info['spot']:.2f}, Call=${info['call_price']:.2f}")
     print(f"\nReturn: ${final_value - initial_value:.2f} ({(final_value/initial_value - 1)*100:.2f}%)")
     
     print("\n✓ Environment working correctly!")
