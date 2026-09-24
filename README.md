@@ -7,7 +7,7 @@ This is an educational reinforcement-learning project, not a live trading system
 - `bsm.py`: European call/put pricing, autograd Greeks, Newton–Raphson implied-volatility inversion.
 - `env.py`: one simulated underlying, one call and one put, each with position −1, 0, or +1 contract. Underlying follows regime-dependent GBM; volatility follows a mean-reverting process by default.
 - `train.py`: Stable-Baselines3 PPO training; writes model and run metadata.
-- `evaluate.py`: paired comparison of hold-cash, random, simple regime rule, and saved PPO models on the same held-out simulated paths.
+- `evaluate.py`: paired comparison of hold-cash, random, simple regime rule, and saved PPO models on matched paths, including fixed bull/bear trajectory scenarios.
 - `visualize.py`: episode charts, action counts, and exploratory reward comparison. `episode_summary.png` shows account value, daily profit/loss, and drawdown.
 - `tests/`: regression checks for trade cash flows, liquidation, rewards, and chart calculations.
 
@@ -23,7 +23,7 @@ python visualize.py --episodes 20 # requires a saved model from train.py
 python evaluate.py --help         # paired policy study options
 ```
 
-Training outputs and plots go under `experiments/`; this directory is ignored by Git. No trained model is shipped with this repository. The [pre-registered evaluation protocol](docs/EVALUATION_PROTOCOL.md) and [synthetic study results](docs/EVALUATION_RESULTS.md) document one reproducible comparison.
+Training outputs and plots go under `experiments/`; this directory is ignored by Git. No trained model is shipped with this repository. The [paired evaluation protocol](docs/EVALUATION_PROTOCOL.md), [fixed-regime study protocol](docs/REGIME_STUDY_PROTOCOL.md), and [synthetic study results](docs/EVALUATION_RESULTS.md) document both comparisons.
 
 ## Environment in plain language
 
@@ -39,11 +39,11 @@ Base reward is change in marked portfolio value divided by initial cash. With re
 
 `episode_summary.png` explains one **simulated** path: whether account value rose, which days made/lost money, and how far value fell from a prior peak. It does not establish out-of-sample performance. The paired 20-path study is stronger than a single trajectory, but still only measures this simulator. One PPO seed matched the simple observed-regime rule on all reported episode metrics; the other seeds did not show a consistent advantage over that rule. See [results and limitations](docs/EVALUATION_RESULTS.md). Any model trained before the accounting fix must be retrained before interpretation.
 
-### Paired policy results
+### P&L paths in bull and bear regimes
 
-![Terminal portfolio return distributions and per-seed return differences versus random across 20 held-out synthetic market paths.](docs/figures/paired-policy-results.png)
+![Mean cumulative marked P&L for cash, random, the regime-call rule, and three PPO training seeds, shown separately for fixed bull and bear simulator regimes with 10th to 90th percentile bands across 20 paths.](docs/figures/controlled-regime-pnl.png)
 
-Each point is one held-out path. Left: terminal portfolio return by policy. Right: policy return minus random-policy return on the same path; dashed line marks zero. Figure summarizes simulator output only. PPO seed 11 reproduces the simple regime rule's reported results, while seeds 23 and 37 vary; results do not show a consistent PPO advantage. See [full metrics, paired comparisons, and limitations](docs/EVALUATION_RESULTS.md).
+Each panel holds its market regime fixed for all 60 trading steps. Lines show mean cumulative marked P&L across the same 20 seeded market paths; shaded bands show the 10th–90th percentile. PPO models were trained in the mixed-regime environment and not retrained for these scenarios. Results vary by training seed and do not establish a market edge. See [terminal-return distributions, detailed metrics, and limitations](docs/EVALUATION_RESULTS.md).
 
 Important limits: simulated BSM prices use same volatility recovered by IV solver, so project does **not** demonstrate volatility mispricing or arbitrage. No order-book liquidity, margin requirement, collateral, dividends, stock hedging, or historical-data validation is modeled. Cash balance accrues risk-free rate, including negative balances and short-sale proceeds; that simplified financing assumption is not a realistic brokerage model. Naked short options are permitted in simulator and can produce losses beyond initial cash. This is not investment advice.
 

@@ -257,6 +257,8 @@ def write_regime_report(episodes, output_dir, episode_length=60, model_paths=Non
     for row in trajectories:
         grouped[(row["regime_scenario"], row["policy"], row["training_seed"], row["market_seed"])].append(row)
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=True)
+    legend_handles = []
+    legend_labels = []
     for axis, scenario in zip(axes, ("bull", "bear")):
         policy_groups = defaultdict(list)
         for (row_scenario, policy, training_seed, _), path in grouped.items():
@@ -275,20 +277,33 @@ def write_regime_report(episodes, output_dir, episode_length=60, model_paths=Non
             lower, upper = np.quantile(curves, [0.1, 0.9], axis=0)
             (line,) = axis.plot(steps, average, label=label, linewidth=1.8)
             axis.fill_between(steps, lower, upper, color=line.get_color(), alpha=0.12)
+            if scenario == "bull":
+                legend_handles.append(line)
+                legend_labels.append(label)
         axis.axhline(0, color="gray", linestyle="--", linewidth=1)
         axis.set_title(f"{scenario.capitalize()} regime (fixed)")
         axis.set_xlabel("Trading step")
         axis.grid(alpha=0.2)
     axes[0].set_ylabel("Mean cumulative marked P&L ($)")
-    axes[1].legend(frameon=False, fontsize=8)
-    fig.suptitle(f"Policy P&L in controlled regimes ({len(set(e['seed'] for e in episodes))} paired paths)")
+    fig.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        ncol=3,
+        frameon=False,
+        fontsize=8,
+    )
+    fig.suptitle(
+        f"Policy P&L in controlled regimes ({len(set(e['seed'] for e in episodes))} paired paths)",
+        y=0.99,
+    )
     fig.text(
         0.5,
         0.01,
         "Lines: mean across paths; bands: 10th–90th percentile. Synthetic simulator only.",
         ha="center",
     )
-    fig.tight_layout(rect=(0, 0.04, 1, 0.93))
+    fig.tight_layout(rect=(0, 0.04, 1, 0.84))
     fig.savefig(targets[1], dpi=160)
     plt.close(fig)
 
