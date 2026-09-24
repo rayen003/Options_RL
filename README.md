@@ -39,6 +39,12 @@ Base reward is change in marked portfolio value divided by initial cash. With re
 
 `episode_summary.png` explains one **simulated** path: whether account value rose, which days made/lost money, and how far value fell from a prior peak. It does not establish out-of-sample performance. The paired 20-path study is stronger than a single trajectory, but still only measures this simulator. One PPO seed matched the simple observed-regime rule on all reported episode metrics; the other seeds did not show a consistent advantage over that rule. See [results and limitations](docs/EVALUATION_RESULTS.md). Any model trained before the accounting fix must be retrained before interpretation.
 
+### Paired policy results
+
+![Terminal portfolio return distributions and per-seed return differences versus random across 20 held-out synthetic market paths.](docs/figures/paired-policy-results.png)
+
+Each point is one held-out path. Left: terminal portfolio return by policy. Right: policy return minus random-policy return on the same path; dashed line marks zero. Figure summarizes simulator output only. PPO seed 11 reproduces the simple regime rule's reported results, while seeds 23 and 37 vary; results do not show a consistent PPO advantage. See [full metrics, paired comparisons, and limitations](docs/EVALUATION_RESULTS.md).
+
 Important limits: simulated BSM prices use same volatility recovered by IV solver, so project does **not** demonstrate volatility mispricing or arbitrage. No order-book liquidity, margin requirement, collateral, dividends, stock hedging, or historical-data validation is modeled. Cash balance accrues risk-free rate, including negative balances and short-sale proceeds; that simplified financing assumption is not a realistic brokerage model. Naked short options are permitted in simulator and can produce losses beyond initial cash. This is not investment advice.
 
 ## Next research step
