@@ -16,8 +16,10 @@ from evaluate import (
     choose_action,
     paired_differences,
     run_policy_episode,
+    run_regime_study,
     run_study,
     summarize_results,
+    write_regime_report,
     write_report,
 )
 
@@ -59,6 +61,52 @@ def test_same_seed_gives_same_market_path_for_different_policies():
     assert cash["spots"] == pytest.approx(random["spots"])
     assert cash["spots"] == pytest.approx(rule["spots"])
     assert cash["regimes"] == random["regimes"] == rule["regimes"]
+
+
+@pytest.mark.parametrize(("scenario", "expected_regime"), [("bull", 1), ("bear", -1)])
+def test_controlled_regime_episode_keeps_regime_fixed(scenario, expected_regime):
+    result = run_policy_episode(
+        "cash", seed=20_000, episode_length=4, regime_scenario=scenario
+    )
+
+    assert result["regime_scenario"] == scenario
+    assert result["regimes"] == [expected_regime] * 5
+    assert result["portfolio_values"][0] == pytest.approx(10_000)
+    assert len(result["portfolio_values"]) == 5
+
+
+def test_controlled_regime_rejects_unknown_scenario():
+    with pytest.raises(ValueError, match="regime scenario"):
+        run_policy_episode("cash", seed=20_000, episode_length=2, regime_scenario="sideways")
+
+
+def test_regime_study_pairs_paths_across_all_methods_and_scenarios():
+    rows = run_regime_study(seeds=[20_000], episode_length=3)
+
+    assert len(rows) == 6
+    assert {row["regime_scenario"] for row in rows} == {"bull", "bear"}
+    for scenario in ("bull", "bear"):
+        scenario_rows = [row for row in rows if row["regime_scenario"] == scenario]
+        assert {row["policy"] for row in scenario_rows} == {"cash", "random", "regime_call"}
+        assert all(row["spots"] == pytest.approx(scenario_rows[0]["spots"]) for row in scenario_rows)
+        assert all(row["regimes"] == scenario_rows[0]["regimes"] for row in scenario_rows)
+
+
+def test_regime_report_writes_step_level_pnl_and_plot(tmp_path):
+    rows = run_regime_study(seeds=[20_000], episode_length=2)
+
+    write_regime_report(rows, tmp_path, episode_length=2)
+
+    with (tmp_path / "regime_trajectories.csv").open(newline="") as file:
+        trajectories = list(csv.DictReader(file))
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert len(trajectories) == 18
+    assert {row["regime_scenario"] for row in trajectories} == {"bull", "bear"}
+    assert {row["step"] for row in trajectories} == {"0", "1", "2"}
+    assert {row["cumulative_pnl_dollars"] for row in trajectories if row["step"] == "0"} == {"0.0"}
+    assert manifest["regime_scenarios"] == {"bull": 1, "bear": -1}
+    assert manifest["evaluation_seeds"] == [20_000]
+    assert (tmp_path / "regime_pnl.png").exists()
 
 
 def test_random_actions_and_results_repeat_with_same_seed():
@@ -167,3 +215,23 @@ def test_command_line_runs_baseline_pilot_and_saves_report(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (output / "episodes.csv").exists()
     assert "simulated" in result.stdout.lower()
+
+
+def test_command_line_runs_controlled_regime_pilot(tmp_path):
+    output = tmp_path / "regime-pilot"
+    result = subprocess.run(
+        [
+            sys.executable, "-B", "evaluate.py", "--regime-only", "--episodes", "1",
+            "--episode-length", "2", "--seed-start", "20_000", "--output", str(output),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (output / "regime_trajectories.csv").exists()
+    assert (output / "regime_pnl.png").exists()
+    assert "bull" in result.stdout.lower()

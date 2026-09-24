@@ -469,6 +469,13 @@ class OptionsEnv(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self.np_random = np.random.default_rng(seed)
+        options = options or {}
+        initial_regime = options.get("initial_regime")
+        if initial_regime is not None:
+            if isinstance(initial_regime, bool) or initial_regime not in (-1, 1):
+                raise ValueError("initial_regime must be -1 (bear) or 1 (bull)")
+            if not self.use_regime:
+                raise ValueError("initial_regime requires use_regime=True")
         
         # Reset state variables
         self.spot = self.initial_spot
@@ -486,9 +493,13 @@ class OptionsEnv(gym.Env):
         
         self.step_count = 0
         
-        # Reset market regime (random start: 50% bull, 50% bear)
+        # Reset market regime (random start unless caller requests a scenario)
         if self.use_regime:
-            self.regime = 1 if self.np_random.random() < 0.5 else -1
+            self.regime = (
+                int(initial_regime)
+                if initial_regime is not None
+                else (1 if self.np_random.random() < 0.5 else -1)
+            )
         else:
             self.regime = 1  # Default to bull if regimes disabled
         
