@@ -99,6 +99,7 @@ def train(
     gamma: float = 0.99,
     seed: int = 42,
     episode_length: int = 60,
+    output_dir=None,
 ):
     """
     Train a PPO agent on the options trading environment.
@@ -112,12 +113,20 @@ def train(
         gamma: Discount factor
         seed: Random seed
         episode_length: Number of trading days per episode (default: 60)
+        output_dir: Exact new directory for model and metadata; generated if omitted
     
     Returns:
         model: Trained PPO model
         episode_rewards: List of rewards per episode
         exp_dir: Path to experiment directory
     """
+    # Reserve output before expensive training; fail fast on permissions/collisions.
+    if output_dir is None:
+        exp_dir = create_experiment_dir("experiments")
+    else:
+        exp_dir = os.fspath(output_dir)
+        os.makedirs(exp_dir, exist_ok=False)
+
     print("=" * 60)
     print("OPTIONS RL TRAINING")
     print("=" * 60)
@@ -174,8 +183,11 @@ def train(
     print("-" * 60)
     print(f"   Training complete!")
     print(f"   Total Episodes: {len(callback.episode_rewards)}")
-    print(f"   Best Episode Reward: {callback.best_reward:+.4f}")
-    print(f"   Final Avg Reward (10ep): {np.mean(callback.episode_rewards[-10:]):+.4f}")
+    if callback.episode_rewards:
+        print(f"   Best Training Reward: {callback.best_reward:+.4f}")
+        print(f"   Final Avg Training Reward (10ep): {np.mean(callback.episode_rewards[-10:]):+.4f}")
+    else:
+        print("   No complete training episode at this timestep budget")
     
     # =========================================================================
     # Save Model and Experiment
@@ -183,7 +195,6 @@ def train(
     print("\n4. Saving Model...")
     
     # Create experiment directory
-    exp_dir = create_experiment_dir("experiments")
     model_path = os.path.join(exp_dir, "model")
     model.save(model_path)
     
@@ -194,63 +205,19 @@ def train(
     metadata_path = os.path.join(exp_dir, "training_metadata.txt")
     with open(metadata_path, "w") as f:
         f.write(f"Total Timesteps: {total_timesteps}\n")
+        f.write(f"Actual Timesteps: {model.num_timesteps}\n")
         f.write(f"Learning Rate: {learning_rate}\n")
         f.write(f"Gamma: {gamma}\n")
         f.write(f"Seed: {seed}\n")
         f.write(f"Episode Length: {episode_length} trading days\n")
+        f.write(f"Steps per Update: {n_steps}\n")
+        f.write(f"Batch Size: {batch_size}\n")
+        f.write(f"Epochs per Update: {n_epochs}\n")
         f.write(f"Total Episodes: {len(callback.episode_rewards)}\n")
         f.write(f"Best Episode Reward: {callback.best_reward:.4f}\n")
-        f.write(f"Final Avg Reward (10ep): {np.mean(callback.episode_rewards[-10:]):.4f}\n")
+        if callback.episode_rewards:
+            f.write(f"Final Avg Training Reward (10ep): {np.mean(callback.episode_rewards[-10:]):.4f}\n")
     print(f"   Metadata saved to: {metadata_path}")
-    
-    # =========================================================================
-    # Quick Evaluation
-    # =========================================================================
-    print("\n5. Quick Evaluation (5 episodes)...")
-    print("-" * 60)
-    
-    eval_rewards = []
-    for ep in range(5):
-        obs, info = env.reset(seed=seed + ep + 1000)
-        episode_reward = 0
-        done = False
-        
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
-            done = terminated or truncated
-        
-        eval_rewards.append(episode_reward)
-        print(f"   Episode {ep+1}: Reward = {episode_reward:+.4f}, "
-              f"Final Portfolio = ${info['portfolio_value']:.2f}")
-    
-    print("-" * 60)
-    print(f"   Avg Eval Reward: {np.mean(eval_rewards):+.4f}")
-    
-    # =========================================================================
-    # Compare to Random Agent
-    # =========================================================================
-    print("\n6. Comparison: Trained Agent vs Random Agent...")
-    print("-" * 60)
-    
-    random_rewards = []
-    for ep in range(5):
-        obs, info = env.reset(seed=seed + ep + 2000)
-        episode_reward = 0
-        done = False
-        
-        while not done:
-            action = env.action_space.sample()  # Random action
-            obs, reward, terminated, truncated, info = env.step(action)
-            episode_reward += reward
-            done = terminated or truncated
-        
-        random_rewards.append(episode_reward)
-    
-    print(f"   Trained Agent Avg Reward: {np.mean(eval_rewards):+.4f}")
-    print(f"   Random Agent Avg Reward:  {np.mean(random_rewards):+.4f}")
-    print(f"   Improvement: {np.mean(eval_rewards) - np.mean(random_rewards):+.4f}")
     
     # Save reward curve data
     rewards_path = os.path.join(exp_dir, "episode_rewards.npy")
@@ -260,6 +227,7 @@ def train(
     print("\n" + "=" * 60)
     print("TRAINING COMPLETE")
     print(f"Experiment saved to: {exp_dir}")
+    print("Use evaluate.py for paired held-out policy comparisons")
     print("=" * 60)
     
     return model, callback.episode_rewards, exp_dir
@@ -279,6 +247,8 @@ if __name__ == "__main__":
                         help="Random seed (default: 42)")
     parser.add_argument("--episode-length", type=int, default=60,
                         help="Episode length in trading days (default: 60)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="New directory for this model (default: unique experiments path)")
     
     args = parser.parse_args()
     
@@ -287,4 +257,5 @@ if __name__ == "__main__":
         learning_rate=args.lr,
         seed=args.seed,
         episode_length=args.episode_length,
+        output_dir=args.output_dir,
     )

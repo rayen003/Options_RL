@@ -12,15 +12,11 @@ State Space:
 MDP Structure:
     - State: [spot, tte, call_greeks, put_greeks, call_pos, put_pos, pnls, regime, iv]
     - Action: {0: BUY_CALL, 1: BUY_PUT, 2: SELL_CALL, 3: SELL_PUT, 4: HOLD}
-    - Reward: Change in portfolio value - transaction costs
+    - Base reward: Change in portfolio value (bid/ask costs already in cash flows)
     - Episode: 60 trading days (default)
     
-Educational Note:
-    With both calls and puts, agent can learn:
-    - Hedging (protective puts, covered calls)
-    - Spreads (bull call, bear put, iron condor)
-    - Synthetic positions (synthetic long = long call + short put)
-    - Put-call parity
+    Scope: one call and one put at a single strike; no underlying position,
+    margin, or multi-strike spreads are modeled.
 """
 
 import gymnasium as gym
@@ -40,11 +36,8 @@ class OptionsEnv(gym.Env):
     The agent trades both ATM call and put options over a 60-day episode.
     Stock price evolves via Geometric Brownian Motion (GBM).
     
-    NEW: With both calls AND puts, agent can learn sophisticated strategies:
-        - Hedging: Protective puts, covered calls
-        - Spreads: Bull call, bear put, iron condor, straddles
-        - Synthetics: Synthetic long (call + short put), conversion/reversal
-        - Put-Call Parity: C - P = S - K*e^(-rT)
+    Calls and puts can be combined, but strategies requiring an underlying
+    position or multiple strikes are outside this environment.
     
     Observation Space (~18 features, dynamically sized):
     ┌────────────────────────────────────────────────────────────────┐
@@ -69,10 +62,10 @@ class OptionsEnv(gym.Env):
     └────────────────────────────────────────────────────────────────┘
     
     Action Space (5 discrete actions):
-        0: BUY_CALL  - Buy 1 call contract (or close short call)
-        1: BUY_PUT   - Buy 1 put contract (or close short put)
-        2: SELL_CALL - Sell 1 call contract (or close long call)
-        3: SELL_PUT  - Sell 1 put contract (or close long put)
+        0: BUY_CALL  - Set call position to +1 (reverse short if needed)
+        1: BUY_PUT   - Set put position to +1 (reverse short if needed)
+        2: SELL_CALL - Set call position to -1 (reverse long if needed)
+        3: SELL_PUT  - Set put position to -1 (reverse long if needed)
         4: HOLD      - Do nothing
     """
     
@@ -164,7 +157,7 @@ class OptionsEnv(gym.Env):
         self.iv_penalty_weight = iv_penalty_weight
         self.iv_bonus_weight = iv_bonus_weight
         
-        # REAL-LIFE SETUP:
+        # SIMULATOR SETUP:
         # - true_volatility: Hidden vol that market maker uses (agent doesn't see)
         # - market_price: Price computed from true_volatility
         # - implied_volatility: Agent extracts this using Newton-Raphson
@@ -265,8 +258,7 @@ class OptionsEnv(gym.Env):
         self.call_entry_price = 0.0 # Price we bought/sold call at
         self.put_entry_price = 0.0  # Price we bought/sold put at
         
-        # NEW: Bond investment (uninvested cash earns risk-free rate)
-        # This represents cash sitting in a money market account
+        # Simplified financing: all cash balances accrue at the risk-free rate.
         self.total_interest_earned = 0.0  # Cumulative interest from bonds
         
         self.step_count = 0
@@ -285,7 +277,7 @@ class OptionsEnv(gym.Env):
         """
         Construct the observation vector from current state.
         
-        REAL-LIFE WORKFLOW:
+        SIMULATED QUOTE WORKFLOW:
         ===================
         1. Market maker prices BOTH call and put using true_volatility (hidden)
         2. Agent sees market_prices on screen
@@ -293,7 +285,8 @@ class OptionsEnv(gym.Env):
         4. Agent computes Greeks for BOTH call and put using extracted IV
         5. Agent makes decisions based on extracted IV, NOT true vol
         
-        This is realistic - in real life you never know the "true" volatility!
+        Both quote and extracted IV use the same BSM model. This creates no
+        volatility-pricing edge; inversion mainly exposes a numerical method.
         """
         # =====================================================================
         # STEP 1: Market maker prices BOTH options using TRUE volatility
@@ -319,7 +312,7 @@ class OptionsEnv(gym.Env):
             )
             
             # =====================================================================
-            # STEP 2: Agent extracts IV using Newton-Raphson (REAL-LIFE PROCESS)
+            # STEP 2: Invert the simulated quote with Newton-Raphson.
             # =====================================================================
             # Extract IV from call price (could also use put price)
             self._extract_implied_volatility()
@@ -421,7 +414,7 @@ class OptionsEnv(gym.Env):
         
         NEW: With both calls and puts, we track separate prices, positions, and Greeks.
         
-        REAL-LIFE SETUP:
+        SIMULATOR SETUP:
         - true_vol: Hidden volatility (market maker's secret)
         - implied_vol: What agent extracted using Newton-Raphson
         - iv_error: Difference between true and extracted (numerical error)
@@ -451,7 +444,7 @@ class OptionsEnv(gym.Env):
             "tte": self.tte,
             "regime": self.regime,
             "regime_name": "BULL" if self.regime == 1 else "BEAR",
-            # REAL-LIFE IV SETUP
+            # Simulated quote and extracted IV.
             "true_vol": self.true_volatility,         # Hidden from agent (market maker's)
             "implied_vol": self.implied_volatility,   # Agent's extracted IV
             "iv_error": iv_error,                     # How accurate was Newton-Raphson?
@@ -476,6 +469,13 @@ class OptionsEnv(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self.np_random = np.random.default_rng(seed)
+        options = options or {}
+        initial_regime = options.get("initial_regime")
+        if initial_regime is not None:
+            if isinstance(initial_regime, bool) or initial_regime not in (-1, 1):
+                raise ValueError("initial_regime must be -1 (bear) or 1 (bull)")
+            if not self.use_regime:
+                raise ValueError("initial_regime requires use_regime=True")
         
         # Reset state variables
         self.spot = self.initial_spot
@@ -493,13 +493,17 @@ class OptionsEnv(gym.Env):
         
         self.step_count = 0
         
-        # Reset market regime (random start: 50% bull, 50% bear)
+        # Reset market regime (random start unless caller requests a scenario)
         if self.use_regime:
-            self.regime = 1 if self.np_random.random() < 0.5 else -1
+            self.regime = (
+                int(initial_regime)
+                if initial_regime is not None
+                else (1 if self.np_random.random() < 0.5 else -1)
+            )
         else:
             self.regime = 1  # Default to bull if regimes disabled
         
-        # Reset volatility (REAL-LIFE SETUP)
+        # Reset simulated volatility.
         if self.use_stochastic_vol:
             # TRUE volatility: Market maker's hidden vol (with random start)
             self.true_volatility = self.initial_volatility * (1 + 0.1 * self.np_random.standard_normal())
@@ -526,7 +530,7 @@ class OptionsEnv(gym.Env):
         """
         Simulate the TRUE volatility using Ornstein-Uhlenbeck process.
         
-        REAL-LIFE SETUP:
+        SIMULATOR SETUP:
         ================
         The "market maker" has access to this true volatility.
         The AGENT does NOT see this - they only see market prices.
@@ -667,19 +671,19 @@ class OptionsEnv(gym.Env):
         
         Actions:
             0 (BUY_CALL):  If flat → go long 1 call
-                           If short call → close short call
+                           If short call → reverse to long
                            If long call → do nothing
             
             1 (BUY_PUT):   If flat → go long 1 put
-                           If short put → close short put
+                           If short put → reverse to long
                            If long put → do nothing
             
             2 (SELL_CALL): If flat → go short 1 call
-                           If long call → close long call
+                           If long call → reverse to short
                            If short call → do nothing
             
             3 (SELL_PUT):  If flat → go short 1 put
-                           If long put → close long put
+                           If long put → reverse to short
                            If short put → do nothing
             
             4 (HOLD):      Do nothing
@@ -687,78 +691,61 @@ class OptionsEnv(gym.Env):
         Returns:
             Transaction cost incurred (0 if no trade)
             
-        Educational Note:
-            - BUY_CALL + BUY_PUT = Long Straddle (profit from big moves either way)
-            - SELL_CALL + BUY_PUT = Protective Put (downside protection)
-            - BUY_CALL + SELL_PUT = Synthetic Long (replicates long stock)
+        Buying or selling sets target position to +1 or -1. A reversal closes
+        one contract and opens another, so it trades two contracts.
         """
-        transaction_cost = 0.0
-        
-        # ====================== CALL ACTIONS ======================
-        if action == self.ACTION_BUY_CALL:
-            if self.call_position <= 0:  # Flat or short → buy
-                # Close any short call position first
-                if self.call_position == -1:
-                    # Buying back short call: pay the ask price
-                    buy_price = self.call_price * (1 + self.transaction_cost / 2)
-                    pnl = (self.call_entry_price - buy_price) * 100  # Short profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.call_price * self.transaction_cost / 2 * 100
-                
-                # Go long call
-                self.call_position = 1
-                self.call_entry_price = self.call_price * (1 + self.transaction_cost / 2)
-                transaction_cost += self.call_price * self.transaction_cost / 2 * 100
-                
-        elif action == self.ACTION_SELL_CALL:
-            if self.call_position >= 0:  # Flat or long → sell
-                # Close any long call position first
-                if self.call_position == 1:
-                    # Selling long call: receive the bid price
-                    sell_price = self.call_price * (1 - self.transaction_cost / 2)
-                    pnl = (sell_price - self.call_entry_price) * 100  # Long profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.call_price * self.transaction_cost / 2 * 100
-                
-                # Go short call
-                self.call_position = -1
-                self.call_entry_price = self.call_price * (1 - self.transaction_cost / 2)
-                transaction_cost += self.call_price * self.transaction_cost / 2 * 100
-        
-        # ====================== PUT ACTIONS ======================
-        elif action == self.ACTION_BUY_PUT:
-            if self.put_position <= 0:  # Flat or short → buy
-                # Close any short put position first
-                if self.put_position == -1:
-                    # Buying back short put: pay the ask price
-                    buy_price = self.put_price * (1 + self.transaction_cost / 2)
-                    pnl = (self.put_entry_price - buy_price) * 100  # Short profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.put_price * self.transaction_cost / 2 * 100
-                
-                # Go long put
-                self.put_position = 1
-                self.put_entry_price = self.put_price * (1 + self.transaction_cost / 2)
-                transaction_cost += self.put_price * self.transaction_cost / 2 * 100
-                
-        elif action == self.ACTION_SELL_PUT:
-            if self.put_position >= 0:  # Flat or long → sell
-                # Close any long put position first
-                if self.put_position == 1:
-                    # Selling long put: receive the bid price
-                    sell_price = self.put_price * (1 - self.transaction_cost / 2)
-                    pnl = (sell_price - self.put_entry_price) * 100  # Long profit/loss
-                    self.cash += pnl
-                    transaction_cost = self.put_price * self.transaction_cost / 2 * 100
-                
-                # Go short put
-                self.put_position = -1
-                self.put_entry_price = self.put_price * (1 - self.transaction_cost / 2)
-                transaction_cost += self.put_price * self.transaction_cost / 2 * 100
-        
-        # ACTION_HOLD: do nothing, transaction_cost stays 0
-        
-        return transaction_cost
+        if action == self.ACTION_HOLD:
+            return 0.0
+
+        trades = {
+            self.ACTION_BUY_CALL: ("call", 1),
+            self.ACTION_BUY_PUT: ("put", 1),
+            self.ACTION_SELL_CALL: ("call", -1),
+            self.ACTION_SELL_PUT: ("put", -1),
+        }
+        if action not in trades:
+            raise ValueError(f"Invalid action: {action}")
+
+        option_type, target_position = trades[action]
+        position_name = f"{option_type}_position"
+        current_position = getattr(self, position_name)
+        quantity = target_position - current_position
+        if quantity == 0:
+            return 0.0
+
+        mid = getattr(self, f"{option_type}_price")
+        half_spread = mid * self.transaction_cost / 2
+        fill_price = mid + half_spread if quantity > 0 else mid - half_spread
+        self.cash -= quantity * fill_price * 100
+        setattr(self, position_name, target_position)
+        setattr(self, f"{option_type}_entry_price", fill_price)
+        return abs(quantity) * half_spread * 100
+
+    def _close_positions(self, at_expiry: bool) -> float:
+        """Settle positions into cash; return spread cost on market closes."""
+        spread_cost = 0.0
+        for option_type in ("call", "put"):
+            position_name = f"{option_type}_position"
+            position = getattr(self, position_name)
+            if position == 0:
+                continue
+
+            mid = getattr(self, f"{option_type}_price")
+            if at_expiry:
+                intrinsic = max(
+                    self.spot - self.strike if option_type == "call" else self.strike - self.spot,
+                    0.0,
+                )
+                fill_price = intrinsic
+            else:
+                half_spread = mid * self.transaction_cost / 2
+                fill_price = mid - half_spread if position > 0 else mid + half_spread
+                spread_cost += half_spread * 100
+
+            self.cash += position * fill_price * 100
+            setattr(self, position_name, 0)
+            setattr(self, f"{option_type}_entry_price", 0.0)
+        return spread_cost
     
     def _calculate_portfolio_value(self) -> float:
         """
@@ -787,16 +774,16 @@ class OptionsEnv(gym.Env):
             2. Execute the action (buy/hold/sell)
             3. Simulate stock price movement (GBM)
             4. Record portfolio value AFTER
-            5. Calculate reward = change in value - transaction costs
+            5. Calculate base reward from change in marked portfolio value
             6. Check if episode is done
             7. Return new observation
         
         Args:
-            action: 0 (BUY), 1 (HOLD), or 2 (SELL)
+            action: 0 buy call, 1 buy put, 2 sell call, 3 sell put, 4 hold
         
         Returns:
-            observation: New state vector (8 features)
-            reward: Profit/loss this step minus transaction costs
+            observation: New state vector (16 features with default settings)
+            reward: Normalized portfolio-value change plus shaping terms
             terminated: True if episode ended naturally (e.g., expiration)
             truncated: True if episode ended early (e.g., time limit)
             info: Debug information
@@ -811,24 +798,28 @@ class OptionsEnv(gym.Env):
         self._simulate_price_movement()
         self.step_count += 1
         
-        # 3.5 NEW: Accrue interest on uninvested cash (money market account)
-        # Cash earns risk-free rate per day: r_daily = r_annual / 252
-        # This is realistic - brokers automatically sweep idle cash into money market funds
+        # Simplified financing, including negative cash and short-sale proceeds.
         daily_interest = self.cash * (self.rate / 252)
         self.cash += daily_interest
         self.total_interest_earned += daily_interest
         
-        # 4. Get new observation (also updates self.option_price)
+        # 4. Reprice options after the market move.
         obs = self._get_observation()
-        
-        # 5. Portfolio value after
+        exposure_call = self.call_position
+        exposure_put = self.put_position
+
+        # 5. Liquidate before final reward and reported portfolio value.
+        terminated = self.tte <= 0.001
+        truncated = self.step_count >= self.episode_length and not terminated
+        if terminated or truncated:
+            transaction_cost += self._close_positions(at_expiry=terminated)
+            obs = self._get_observation()
+
         value_after = self._calculate_portfolio_value()
-        
-        # 6. Calculate reward
-        # Reward = Change in portfolio value - Transaction costs
-        # We normalize by initial cash to keep rewards in a reasonable range
+
+        # 6. Cash flows already include bid/ask spread: never subtract it twice.
         raw_pnl = value_after - value_before
-        reward = (raw_pnl - transaction_cost) / self.initial_cash
+        reward = raw_pnl / self.initial_cash
         
          # Track reward components for debugging
         reward_components = {
@@ -843,19 +834,19 @@ class OptionsEnv(gym.Env):
         # NEW: Check both call and put positions
         if self.use_regime:
             # Long calls in bear market = bad (losing money fighting the trend)
-            if self.call_position == 1 and self.regime == -1:
+            if exposure_call == 1 and self.regime == -1:
                 reward -= 0.005
                 reward_components["regime_penalty"] = -0.005
             # Short calls in bull market = bad (missing the upside)
-            elif self.call_position == -1 and self.regime == 1:
+            elif exposure_call == -1 and self.regime == 1:
                 reward -= 0.005
                 reward_components["regime_penalty"] = -0.005
             # Long puts in bull market = bad (puts lose value in bull markets)
-            if self.put_position == 1 and self.regime == 1:
+            if exposure_put == 1 and self.regime == 1:
                 reward -= 0.005
                 reward_components["regime_penalty"] -= 0.005
             # Short puts in bear market = bad (puts gain value in bear markets)
-            elif self.put_position == -1 and self.regime == -1:
+            elif exposure_put == -1 and self.regime == -1:
                 reward -= 0.005
                 reward_components["regime_penalty"] -= 0.005
         
@@ -869,13 +860,13 @@ class OptionsEnv(gym.Env):
             # Example: Long call (delta=0.5) + Short put (delta=-0.5, position=-1) = Synthetic long (delta~1)
             call_delta = self.call_greeks.get("delta", 0.5)
             put_delta = self.put_greeks.get("delta", -0.5)
-            portfolio_delta = self.call_position * call_delta + self.put_position * put_delta
+            portfolio_delta = exposure_call * call_delta + exposure_put * put_delta
             delta_penalty = -self.delta_penalty_weight * abs(portfolio_delta)
             reward += delta_penalty
             reward_components["delta_penalty"] = delta_penalty
             
             # 2. IV PENALTY/BONUS: Buy cheap options, sell expensive ones
-            # This encourages volatility arbitrage behavior
+            # This is a heuristic incentive, not evidence of volatility mispricing.
             current_iv = self.implied_volatility
             
             # Penalize buying when IV is high (options are expensive)
@@ -890,56 +881,7 @@ class OptionsEnv(gym.Env):
                 reward += iv_bonus
                 reward_components["iv_penalty"] = iv_bonus  # Stored as positive
         
-        # 7. Check termination conditions
-        terminated = False
-        truncated = False
-        
-        # Episode ends if:
-        # a) We've reached the episode length
-        if self.step_count >= self.episode_length:
-            truncated = True
-            # Force close any open positions at episode end
-            # NEW: Close both call and put positions
-            if self.call_position != 0:
-                close_cost = self.call_price * self.transaction_cost / 2 * 100
-                if self.call_position == 1:
-                    self.cash += (self.call_price - self.call_entry_price) * 100 - close_cost
-                else:
-                    self.cash += (self.call_entry_price - self.call_price) * 100 - close_cost
-                self.call_position = 0
-            
-            if self.put_position != 0:
-                close_cost = self.put_price * self.transaction_cost / 2 * 100
-                if self.put_position == 1:
-                    self.cash += (self.put_price - self.put_entry_price) * 100 - close_cost
-                else:
-                    self.cash += (self.put_entry_price - self.put_price) * 100 - close_cost
-                self.put_position = 0
-        
-        # b) Options expired (time to expiry reached 0)
-        if self.tte <= 0.001:
-            terminated = True
-            # At expiration: 
-            # Call is worth max(S - K, 0)
-            # Put is worth max(K - S, 0)
-            call_intrinsic = max(0, self.spot - self.strike)
-            put_intrinsic = max(0, self.strike - self.spot)
-            
-            # Settle call position
-            if self.call_position == 1:
-                self.cash += (call_intrinsic - self.call_entry_price) * 100
-            elif self.call_position == -1:
-                self.cash += (self.call_entry_price - call_intrinsic) * 100
-            self.call_position = 0
-            
-            # Settle put position
-            if self.put_position == 1:
-                self.cash += (put_intrinsic - self.put_entry_price) * 100
-            elif self.put_position == -1:
-                self.cash += (self.put_entry_price - put_intrinsic) * 100
-            self.put_position = 0
-        
-        # 8. Get info
+        # 7. Get info
         info = self._get_info()
         info["transaction_cost"] = transaction_cost
         info["reward"] = reward
@@ -955,7 +897,7 @@ class OptionsEnv(gym.Env):
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("OptionsEnv: REAL-LIFE WORKFLOW (Newton-Raphson IV Extraction)")
+    print("OptionsEnv: simulated quotes and implied-volatility extraction")
     print("=" * 80)
     
     # Create environment with regimes and stochastic vol enabled
@@ -965,20 +907,14 @@ if __name__ == "__main__":
     obs, info = env.reset(seed=42)
     
     print("\n" + "-" * 80)
-    print("REAL-LIFE WORKFLOW")
+    print("SIMULATED QUOTE WORKFLOW")
     print("-" * 80)
     print("""
-    1. Market Maker has TRUE volatility (hidden from agent)
-       - Evolves via Ornstein-Uhlenbeck process
-    
-    2. Market Maker prices option using TRUE volatility
-       - Agent sees this price on their screen
-    
-    3. Agent uses NEWTON-RAPHSON to extract IMPLIED volatility
-       - Finds σ such that: BSM(spot, strike, T, r, σ) = Market_Price
-    
-    4. Agent makes decisions using EXTRACTED IV (not true vol!)
-       - Greeks computed from extracted IV
+    1. Simulated volatility evolves via a mean-reverting process.
+    2. BSM generates call and put quotes from that volatility.
+    3. Newton-Raphson inverts the call quote to recover implied volatility.
+    4. Agent observes extracted IV and Greeks, not simulator volatility.
+    This inversion creates no option-pricing edge by itself.
     """)
     
     print("-" * 80)
@@ -990,7 +926,7 @@ if __name__ == "__main__":
     print(f"  Bull Drift: {env.bull_drift:.0%}")
     print(f"  Bear Drift: {env.bear_drift:.0%}")
     print(f"  Switch Probability: {env.regime_switch_prob:.0%} per day")
-    print(f"\nStochastic Volatility: ENABLED (Real-Life Mode)")
+    print(f"\nStochastic Volatility: ENABLED (simulated)")
     print(f"  Initial IV: {env.initial_volatility:.0%}")
     print(f"  Vol of Vol: {env.vol_of_vol:.0%}")
     print(f"  Mean Reversion Speed: {env.vol_mean_reversion}")
@@ -998,8 +934,10 @@ if __name__ == "__main__":
     
     # Feature names for display
     feature_names = [
-        "spot_norm", "tte", "delta", "gamma",
-        "vega", "theta", "position", "pnl", "regime", "implied_iv"
+        "spot_norm", "tte", "call_delta", "call_gamma", "call_vega",
+        "call_theta", "put_delta", "put_gamma", "put_vega", "put_theta",
+        "call_position", "put_position", "call_pnl", "put_pnl",
+        "regime", "implied_iv",
     ]
     
     print("\n" + "-" * 80)
@@ -1007,9 +945,9 @@ if __name__ == "__main__":
     print("-" * 80)
     
     total_reward = 0
-    action_names = {0: "BUY ", 1: "HOLD", 2: "SELL"}
+    action_names = {0: "BUY CALL", 1: "BUY PUT", 2: "SELL CALL", 3: "SELL PUT", 4: "HOLD"}
     
-    print(f"\n{'Step':>4} | {'Regime':>5} | {'TrueVol':>7} | {'ExtractIV':>9} | {'Error':>6} | {'Action':>4} | {'Spot':>7} | {'Reward':>8}")
+    print(f"\n{'Step':>4} | {'Regime':>5} | {'TrueVol':>7} | {'ExtractIV':>9} | {'Error':>6} | {'Action':>9} | {'Spot':>7} | {'Reward':>8}")
     print("-" * 90)
     
     # Run a short episode
@@ -1025,7 +963,7 @@ if __name__ == "__main__":
         true_vol = info['true_vol_pct']
         impl_vol = info['implied_vol_pct']
         iv_err = f"{info['iv_error']*100:.2f}%"
-        print(f"{step:>4} | {regime_str:>5} | {true_vol:>7} | {impl_vol:>9} | {iv_err:>6} | {action_names[action]:>4} | ${info['spot']:>6.2f} | {reward:>+8.4f}")
+        print(f"{step:>4} | {regime_str:>5} | {true_vol:>7} | {impl_vol:>9} | {iv_err:>6} | {action_names[action]:>9} | ${info['spot']:>6.2f} | {reward:>+8.4f}")
         
         if terminated or truncated:
             print("\n[Episode ended]")
@@ -1035,7 +973,7 @@ if __name__ == "__main__":
     print("FINAL STATE")
     print("-" * 80)
     print(f"  Cash:            ${info['cash']:.2f}")
-    print(f"  Position:        {info['position']}")
+    print(f"  Call / Put positions: {info['call_position']} / {info['put_position']}")
     print(f"  Portfolio Value: ${info['portfolio_value']:.2f}")
     print(f"  Total Reward:    {total_reward:.4f}")
     print(f"  Final Regime:    {info['regime_name']}")
@@ -1060,15 +998,15 @@ if __name__ == "__main__":
     initial_value = info['cash']
     
     # Buy on day 0
-    obs, reward, _, _, info = env.step(0)  # BUY
-    print(f"Day 0: BUY  @ ${info['option_price']:.2f}")
+    obs, reward, _, _, info = env.step(env.ACTION_BUY_CALL)
+    print(f"Day 0: BUY CALL @ ${info['call_price']:.2f}")
     
     # Hold for 29 days
     for day in range(1, 30):
-        obs, reward, terminated, truncated, info = env.step(1)  # HOLD
+        obs, reward, terminated, truncated, info = env.step(env.ACTION_HOLD)
     
     final_value = info['portfolio_value']
-    print(f"Day 30: Spot=${info['spot']:.2f}, Option=${info['option_price']:.2f}")
+    print(f"Day 30: Spot=${info['spot']:.2f}, Call=${info['call_price']:.2f}")
     print(f"\nReturn: ${final_value - initial_value:.2f} ({(final_value/initial_value - 1)*100:.2f}%)")
     
     print("\n✓ Environment working correctly!")
